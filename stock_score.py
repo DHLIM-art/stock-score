@@ -215,15 +215,15 @@ def fetch_ohlcv(ticker: str, period_days: int = 400):
             return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), warnings
     except Exception as e:
         warnings.append(f"FinanceDataReader 실패: {e}")
-    # 2) yfinance
+    # 2) yfinance (코스피 .KS / 코스닥 .KQ 양쪽 시도)
     try:
         import yfinance as yf
-        yt = ticker if "." in ticker or not ticker.isdigit() else ticker + ".KS"
-        df = yf.download(yt, start=start, progress=False, auto_adjust=False)
-        if df is not None and len(df) > 30:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), warnings
+        for yt in _yf_candidates(ticker):
+            df = yf.download(yt, start=start, progress=False, auto_adjust=False)
+            if df is not None and len(df) > 30:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), warnings
     except Exception as e:
         warnings.append(f"yfinance 실패: {e}")
     return None, warnings + ["가격 데이터를 가져오지 못했습니다. 인터넷 연결을 확인하세요."]
@@ -296,6 +296,41 @@ def fetch_macro():
 
 
 _LISTING = {}  # KRX 종목명 목록 캐시 (프로세스 1회만 다운로드)
+_YF_SUFFIX = {}  # 종목코드 → ".KS"/".KQ" 캐시
+
+def _yf_symbol(ticker: str):
+    """yfinance 심볼 결정: 코스피=.KS, 코스닥=.KQ (KRX 목록의 Market으로 판별)."""
+    code = _norm_krx(ticker)
+    if "." in ticker or not code.isdigit():
+        return ticker                       # 해외/이미 접미사 있음
+    if code in _YF_SUFFIX:
+        return code + _YF_SUFFIX[code]
+    suffix = ".KS"
+    try:
+        import FinanceDataReader as fdr
+        if "KRX" not in _LISTING:
+            _LISTING["KRX"] = fdr.StockListing("KRX")
+        lst = _LISTING["KRX"]
+        cc = "Code" if "Code" in lst.columns else ("Symbol" if "Symbol" in lst.columns else None)
+        mc = "Market" if "Market" in lst.columns else None
+        if cc and mc:
+            row = lst[lst[cc].astype(str).str.zfill(6) == code]
+            if len(row):
+                mkt = str(row.iloc[0][mc]).upper()
+                suffix = ".KQ" if "KOSDAQ" in mkt else ".KS"
+    except Exception:
+        pass
+    _YF_SUFFIX[code] = suffix
+    return code + suffix
+
+def _yf_candidates(ticker: str):
+    """yfinance에 시도할 심볼 목록(코스피/코스닥 양쪽 폴백)."""
+    code = _norm_krx(ticker)
+    if "." in ticker or not code.isdigit():
+        return [ticker]
+    primary = _yf_symbol(ticker)
+    other = code + (".KQ" if primary.endswith(".KS") else ".KS")
+    return [primary, other]
 
 def fetch_name(ticker: str):
     """종목명을 여러 소스에서 시도: pykrx → FDR 종목목록 → yfinance."""
@@ -322,14 +357,14 @@ def fetch_name(ticker: str):
                 return str(hit.iloc[0][nc]).strip()
     except Exception:
         pass
-    # 3) yfinance
+    # 3) yfinance (코스피 .KS / 코스닥 .KQ 양쪽 시도)
     try:
         import yfinance as yf
-        yt = ticker if ("." in ticker or not code.isdigit()) else code + ".KS"
-        info = yf.Ticker(yt).info
-        nm = info.get("shortName") or info.get("longName")
-        if nm:
-            return str(nm).strip()
+        for yt in _yf_candidates(ticker):
+            info = getattr(yf.Ticker(yt), "info", None) or {}
+            nm = info.get("shortName") or info.get("longName")
+            if nm:
+                return str(nm).strip()
     except Exception:
         pass
     return None
@@ -492,13 +527,18 @@ def fetch_naver(ticker: str):
 
 def fetch_yf_fundamentals(ticker: str):
     """yfinance(.info)에서 ROE·PER·PBR·배당·부채·EPS성장·목표주가 보강.
-    미국 기반 클라우드(예: Streamlit Cloud)에서 네이버보다 안정적일 때가 많음."""
+    미국 기반 클라우드(예: Streamlit Cloud)에서 네이버보다 안정적일 때가 많음.
+    코스피 .KS / 코스닥 .KQ 양쪽을 시도해 값이 있는 쪽을 사용."""
     out, warns = {}, []
-    code = _norm_krx(ticker)
-    yt = ticker if ("." in ticker or not code.isdigit()) else code + ".KS"
     try:
         import yfinance as yf
-        info = getattr(yf.Ticker(yt), "info", None) or {}
+        info = {}
+        for yt in _yf_candidates(ticker):
+            cand = getattr(yf.Ticker(yt), "info", None) or {}
+            # 가격/시총이 잡히면 유효한 심볼로 간주
+            if cand.get("regularMarketPrice") or cand.get("marketCap") or cand.get("trailingPE"):
+                info = cand
+                break
         roe = info.get("returnOnEquity")
         if roe is not None:
             out["roeAnnual"] = r1(roe * 100)
@@ -532,31 +572,31 @@ def fetch_yf_quarter_roe(ticker: str):
     """yfinance 분기 재무제표에서 '가장 최근 발표 분기' ROE를 연환산해서 반환.
     분기 ROE(연환산) = 최근 분기 순이익 × 4 ÷ 자기자본 × 100. 실패 시 None."""
     code = _norm_krx(ticker)
-    yt = ticker if ("." in ticker or not code.isdigit()) else code + ".KS"
     try:
         import yfinance as yf
-        t = yf.Ticker(yt)
-        qf = getattr(t, "quarterly_income_stmt", None)
-        if qf is None or qf.empty:
-            qf = getattr(t, "quarterly_financials", None)
-        qb = getattr(t, "quarterly_balance_sheet", None)
-        if qf is None or qb is None or qf.empty or qb.empty:
-            return None
+        for yt in _yf_candidates(ticker):
+            t = yf.Ticker(yt)
+            qf = getattr(t, "quarterly_income_stmt", None)
+            if qf is None or qf.empty:
+                qf = getattr(t, "quarterly_financials", None)
+            qb = getattr(t, "quarterly_balance_sheet", None)
+            if qf is None or qb is None or qf.empty or qb.empty:
+                continue
 
-        def pick(dfin, names):
-            for nm in names:
-                if nm in dfin.index:
-                    s = dfin.loc[nm].dropna()
-                    if len(s):
-                        return float(s.iloc[0])   # 가장 최근 분기(열 맨 앞)
-            return None
+            def pick(dfin, names):
+                for nm in names:
+                    if nm in dfin.index:
+                        s = dfin.loc[nm].dropna()
+                        if len(s):
+                            return float(s.iloc[0])   # 가장 최근 분기(열 맨 앞)
+                return None
 
-        ni = pick(qf, ["Net Income", "NetIncome", "Net Income Common Stockholders",
-                       "Net Income From Continuing Operation Net Minority Interest"])
-        eq = pick(qb, ["Stockholders Equity", "Total Stockholder Equity",
-                       "Common Stock Equity", "Total Equity Gross Minority Interest"])
-        if ni is not None and eq and eq > 0:
-            return r1(ni * 4 / eq * 100)
+            ni = pick(qf, ["Net Income", "NetIncome", "Net Income Common Stockholders",
+                           "Net Income From Continuing Operation Net Minority Interest"])
+            eq = pick(qb, ["Stockholders Equity", "Total Stockholder Equity",
+                           "Common Stock Equity", "Total Equity Gross Minority Interest"])
+            if ni is not None and eq and eq > 0:
+                return r1(ni * 4 / eq * 100)
     except Exception:
         pass
     return None
