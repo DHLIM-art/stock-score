@@ -640,8 +640,8 @@ def fetch_yf_fundamentals(ticker: str):
 
 
 def fetch_yf_quarter_roe(ticker: str):
-    """yfinance 분기 재무제표에서 '가장 최근 발표 분기' ROE를 연환산해서 반환.
-    분기 ROE(연환산) = 최근 분기 순이익 × 4 ÷ 자기자본 × 100. 실패 시 None."""
+    """yfinance 분기 재무제표에서 TTM(최근 4개 분기 합산) ROE 계산.
+    ROE = 최근 4분기 순이익 합 ÷ 최근 자기자본 × 100. (분기 1개뿐이면 연환산) 실패 시 None."""
     code = _norm_krx(ticker)
     try:
         import yfinance as yf
@@ -654,20 +654,27 @@ def fetch_yf_quarter_roe(ticker: str):
             if qf is None or qb is None or qf.empty or qb.empty:
                 continue
 
-            def pick(dfin, names):
-                for nm in names:
-                    if nm in dfin.index:
-                        s = dfin.loc[nm].dropna()
-                        if len(s):
-                            return float(s.iloc[0])   # 가장 최근 분기(열 맨 앞)
-                return None
-
-            ni = pick(qf, ["Net Income", "NetIncome", "Net Income Common Stockholders",
-                           "Net Income From Continuing Operation Net Minority Interest"])
-            eq = pick(qb, ["Stockholders Equity", "Total Stockholder Equity",
-                           "Common Stock Equity", "Total Equity Gross Minority Interest"])
-            if ni is not None and eq and eq > 0:
-                return r1(ni * 4 / eq * 100)
+            ni_row = None
+            for nm in ["Net Income", "NetIncome", "Net Income Common Stockholders",
+                       "Net Income From Continuing Operation Net Minority Interest"]:
+                if nm in qf.index:
+                    s = qf.loc[nm].dropna()
+                    if len(s):
+                        ni_row = s
+                        break
+            eq = None
+            for nm in ["Stockholders Equity", "Total Stockholder Equity",
+                       "Common Stock Equity", "Total Equity Gross Minority Interest"]:
+                if nm in qb.index:
+                    s = qb.loc[nm].dropna()
+                    if len(s):
+                        eq = float(s.iloc[0])      # 최근 분기 자기자본
+                        break
+            if ni_row is None or not eq or eq <= 0:
+                continue
+            vals = [float(v) for v in ni_row.values[:4]]   # 최근 최대 4개 분기
+            ttm_ni = sum(vals) * (4.0 / len(vals))         # 4개면 그대로 TTM, 적으면 연환산
+            return r1(ttm_ni / eq * 100)
     except Exception:
         pass
     return None
@@ -817,18 +824,29 @@ def fetch_dart(ticker, api_key):
         return out, warns
     by, rc, ann, lab, accts = picked
     ni, eq, debt = accts.get("당기순이익"), accts.get("자본총계"), accts.get("부채총계")
-    if ni is not None and eq:
-        roe = r1(ni * ann / eq * 100)        # 분기 누적 순이익 → 연환산 ROE
-        out["roeAnnual"] = roe
-        out["roeQuarter"] = roe
+    prev_same = _dart_accounts(corp, by - 1, rc, api_key)        # 전년 동기 누적
+    # TTM 순이익 = 올해 누적 + (작년 연간 − 작년 동기 누적). 연간보고서면 그대로.
+    ttm_ni = None
+    if ni is not None:
+        if rc == "11011":
+            ttm_ni = ni
+        else:
+            prev_annual = _dart_accounts(corp, by - 1, "11011", api_key)
+            psn = prev_same.get("당기순이익") if prev_same else None
+            pan = prev_annual.get("당기순이익") if prev_annual else None
+            if psn is not None and pan is not None:
+                ttm_ni = ni + pan - psn          # 정확한 TTM
+            else:
+                ttm_ni = ni * ann                # 폴백: 누적분 연환산
+    if ttm_ni is not None and eq:
+        out["roeAnnual"] = r1(ttm_ni / eq * 100)  # TTM ROE
     if debt is not None and eq:
         out["debtRatio"] = r1(debt / eq * 100)
-    # 순이익 YoY: 같은 보고서코드의 전년도와 비교 → EPS 성장 대용
-    prev = _dart_accounts(corp, by - 1, rc, api_key)
-    if prev and ni is not None:
-        pni = prev.get("당기순이익")
-        if pni not in (None, 0):
-            out["epsGrowthQoQ"] = r1((ni - pni) / abs(pni) * 100)
+    # EPS 성장(순이익 YoY): 올해 누적 vs 전년 동기 누적
+    if prev_same and ni is not None:
+        psn = prev_same.get("당기순이익")
+        if psn not in (None, 0):
+            out["epsGrowthQoQ"] = r1((ni - psn) / abs(psn) * 100)
             out["epsAccelQuarters"] = 2 if out["epsGrowthQoQ"] > 0 else 0
     out["_dartLabel"] = f"{by} {lab}"
     return out, warns
@@ -912,15 +930,13 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
             srcmap[lab] = chosen
         data["_src"] = srcmap
 
-        # 분기 ROE(연환산): DART 우선 → yfinance 분기 재무제표
-        if "roeQuarter" in dt:
-            data["roeQuarter"] = dt["roeQuarter"]
-            srcmap["ROE(분기)"] = "DART(공시)"
-        else:
-            roeQ = fetch_yf_quarter_roe(ticker)
-            data["roeQuarter"] = roeQ
-            if roeQ is not None:
-                srcmap["ROE(분기)"] = "yfinance(최근분기 연환산)"
+        # 분기 재무제표 기반 TTM ROE: DART/네이버/.info 에서 ROE를 못 받았을 때 채움
+        if srcmap.get("ROE") == "기본값(중립)":
+            roeT = fetch_yf_quarter_roe(ticker)
+            if roeT is not None:
+                data["roeAnnual"] = roeT
+                data["roeQuarter"] = roeT
+                srcmap["ROE"] = "yfinance(분기 TTM)"
 
         # EPS 성장이 DART·네이버·yfinance(.info) 모두 없으면 → 분기 재무제표로 직접 계산
         if not any("epsGrowthQoQ" in s for s, _ in sources):
@@ -964,10 +980,11 @@ def _dcfUp(d):    return (d["dcfFairValue"] / d["price"] - 1) * 100
 def _tgtUp(d):    return (d["targetPrice"] / d["price"] - 1) * 100
 
 def _roe_eff(d):
-    """점수용 ROE: TTM 60% + 최근 분기(연환산) 40%. 분기값 없으면 TTM만."""
-    ttm = d.get("roeAnnual", d["roeThreshold"])
-    q = d.get("roeQuarter")
-    return ttm * 0.6 + q * 0.4 if q is not None else ttm
+    """점수용 ROE = TTM(최근 1년) ROE. 최근 분기는 TTM에 이미 포함됨."""
+    v = d.get("roeAnnual")
+    if v is None:
+        v = d.get("roeQuarter")
+    return v if v is not None else d["roeThreshold"]
 
 _REGIME = {"STRONG_BULL": 85, "BULL": 68, "NEUTRAL": 50, "BEAR": 25}
 _OBV = {"up": 75, "flat": 50, "down": 25}          # 스마트머니: 점수로 직접 사용
@@ -978,13 +995,12 @@ METRICS = [
          score=lambda d: clamp(50 + d["epsGrowthQoQ"]*0.4 + (10 if d["epsAccelQuarters"] >= 2 else 0)),
          comment=lambda d: f"최근 분기 순이익이 {'+' if d['epsGrowthQoQ']>=0 else ''}{r1(d['epsGrowthQoQ'])}% 변동했어요. " +
                            ("성장세예요." if d["epsAccelQuarters"] >= 2 else "성장 신호는 약해요.")),
-    dict(tag="A", title="ROE 실적", sub="자기자본이익률(TTM+최근분기 반영)",
+    dict(tag="A", title="ROE 실적", sub="자기자본이익률(TTM·최근1년)",
          score=lambda d: clamp(55 + (_roe_eff(d) - d["roeThreshold"]) * 1.8) if _roe_eff(d) >= d["roeThreshold"]
                          else clamp(_roe_eff(d) / d["roeThreshold"] * 55, 0, 55),
-         comment=lambda d: (f"ROE(TTM) {r1(d['roeAnnual'])}%" +
-                            (f" · 최근분기(연환산) {r1(d['roeQuarter'])}%" if d.get("roeQuarter") is not None else "") +
-                            f" → 반영 ROE {r1(_roe_eff(d))}% (기준 {r1(d['roeThreshold'])}%). " +
-                            ("기준 통과예요." if _roe_eff(d) >= d["roeThreshold"] else "기준 미달이에요."))),
+         comment=lambda d: (f"ROE(TTM) {r1(_roe_eff(d))}% (기준 {r1(d['roeThreshold'])}%). " +
+                            ("기준 통과예요." if _roe_eff(d) >= d["roeThreshold"] else "기준 미달이에요.") +
+                            (" 최근 분기 실적은 EPS 가속도에 반영돼요." ))),
     dict(tag="N", title="신고가·피벗 돌파", sub="52주 최고가 및 패턴 돌파",
          score=lambda d: clamp(90 - _distHigh(d)*2.0 + (6 if d["pivotBreak"] else 0)),
          comment=lambda d: f"52주 최고가에서 {r1(_distHigh(d))}% 아래에 있어요. " +
