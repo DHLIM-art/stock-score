@@ -133,6 +133,12 @@ with st.sidebar:
         if st.session_state.df is not None:
             b = st.session_state.base
             st.success(f"✅ {b.get('name','')} 불러옴 · 현재가 {b['price']:,.0f}")
+            srcmap = b.get("_src") or {}
+            if srcmap:
+                with st.expander("📑 데이터 출처 (ROE·PER 등)"):
+                    for lab, src in srcmap.items():
+                        st.caption(f"· {lab}: {src}")
+                    st.caption("‘yfinance(TTM)’이면 분기값이 아니라 최근 12개월 기준이에요.")
         else:
             st.error("⚠️ 가격 데이터를 못 가져왔어요. 티커/인터넷을 확인하거나 아래에서 직접 입력하세요.")
 
