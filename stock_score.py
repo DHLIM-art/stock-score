@@ -633,10 +633,11 @@ METRICS = [
                            ("아직 신고가까지 거리가 있어요. " if _distHigh(d) > 3 else "신고가 부근이에요. ") +
                            ("컵앤핸들 피벗 돌파가 감지됐어요." if d["pivotBreak"] else "")),
     dict(tag="S", title="거래량 확인 돌파", sub="기관 참여를 동반한 거래량 급증",
-         score=lambda d: clamp(20 + (d["volumeRatioVsAvg"]-1)*60) if d["breakoutSignal"]
-                         else r1(-(d["volumeRatioVsAvg"]-0.3)*15),
+         score=lambda d: clamp(60 + (d["volumeRatioVsAvg"]-1)*40) if d["breakoutSignal"]
+                         else clamp(35 + (d["volumeRatioVsAvg"]-1)*20),
          comment=lambda d: f"거래량이 평소의 {r1(d['volumeRatioVsAvg'])}배예요. " +
-                           ("돌파를 거래량이 확인했어요." if d["breakoutSignal"] else "돌파 신호는 없어요.")),
+                           ("거래량을 동반한 돌파가 확인됐어요." if d["breakoutSignal"]
+                            else "아직 돌파 신호는 없어요(거래량 수준만 평가).")),
     dict(tag="L", title="주도주 판별", sub="시장 대비 상대강도 측정",
          score=lambda d: clamp(d["rsRating"] - 79),
          comment=lambda d: f"시장 대비 상대강도(RS) {int(d['rsRating'])}점이에요. " +
@@ -683,9 +684,10 @@ METRICS = [
     dict(tag="Math", title="통계적 Z-Score", sub="통계적 과매수/과매도 위치",
          score=lambda d: clamp(50 - (abs(d["zScoreStat"])-1.2)*20),
          comment=lambda d: f"통계적 Z-Score +{r1(d['zScoreStat'])}이에요. {'정상 범위예요.' if abs(d['zScoreStat'])<1.5 else '극단 구간이에요.'}"),
-    dict(tag="Adj", title="변동성 조정", sub="변동성 대비 수익률 효율성", canNeg=True,
-         score=lambda d: r1(-(d["volMultiplier"]-1)*22.8),
-         comment=lambda d: f"변동성 대비 수익률 효율을 반영해 최종 점수에 ×{r1(d['volMultiplier'])} 배율이 적용됐어요."),
+    dict(tag="Adj", title="변동성 조정", sub="낙폭 대비 수익률 효율(칼마형)",
+         score=lambda d: clamp(40 + (d["return12m"] / max(abs(d["mddPct"]), 1.0)) * 8),
+         comment=lambda d: f"12개월 수익률 {r1(d['return12m'])}% 대비 최대낙폭 {r1(d['mddPct'])}% — "
+                           f"위험 대비 효율이 {'높아요' if (d['return12m']/max(abs(d['mddPct']),1))>=2 else '보통이에요' if (d['return12m']/max(abs(d['mddPct']),1))>=0.5 else '낮아요'}."),
     dict(tag="Sentiment", title="시장 심리 추정", sub="가격·거래량 기반 투자 심리",
          score=lambda d: clamp(55 + (d["upVolPct"]-50) + (d["closeStrength"]-50)*0.6 + d["gapDir"]*8),
          comment=lambda d: f"가격·거래량으로 추정한 심리는 '{'약한 상승' if d['upVolPct']>=60 else '중립'}'이에요. 상승 거래량 {int(d['upVolPct'])}%, 종가 강도 {int(d['closeStrength'])}%."),

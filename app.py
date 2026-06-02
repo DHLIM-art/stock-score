@@ -408,9 +408,9 @@ with right:
         grid([m for m in res["metrics"] if m["tag"] == "Value"])
     with t3:
         st.caption(f"모멘텀 종합: {res['styles']['모멘텀']}점 — 추세·상대강도·기술적 신호")
-        metric_summary("모멘텀·기술 요약", [m for m in res["metrics"] if m["tag"] in ("Quant", "Math")])
+        metric_summary("모멘텀·기술 요약", [m for m in res["metrics"] if m["tag"] in ("Quant", "Math", "Adj")])
         st.write("")
-        grid([m for m in res["metrics"] if m["tag"] in ("Quant", "Math")])
+        grid([m for m in res["metrics"] if m["tag"] in ("Quant", "Math", "Adj")])
     with t4:
         st.caption(f"매크로(시장 환경) 종합: {res['styles']['매크로']}점 — 종목 무관 시장 전반")
         metric_summary("매크로 요약", [m for m in res["metrics"] if m["tag"] == "Macro"])
