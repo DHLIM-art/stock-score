@@ -371,9 +371,9 @@ def fetch_name(ticker: str):
 
 
 _UNIVERSE = None
-def build_universe():
+def build_universe(dart_key: str | None = None):
     """검색용 종목 목록: 코스피·코스닥·미국(NASDAQ·NYSE·AMEX) 의 (종목명, 심볼, 시장).
-    미국 거래소에는 S&P500·다우·러셀 구성종목이 모두 포함됨. 재무 데이터는 미포함."""
+    한국은 FDR KRX → 막히면 DART corpCode 로 폴백(클라우드에서 안정적)."""
     global _UNIVERSE
     if _UNIVERSE is not None:
         return _UNIVERSE
@@ -381,7 +381,8 @@ def build_universe():
     try:
         import FinanceDataReader as fdr
 
-        # --- 한국: KRX 전체 목록에서 Market 으로 코스피/코스닥 분리 (가장 안정적) ---
+        # --- 한국 1순위: FDR KRX (Market 으로 코스피/코스닥 분리) ---
+        kr_rows = []
         try:
             krx = fdr.StockListing("KRX")
             cc = "Code" if "Code" in krx.columns else ("Symbol" if "Symbol" in krx.columns else None)
@@ -398,12 +399,19 @@ def build_universe():
                     if "KOSDAQ" in mk or "코스닥" in mk:
                         label = "코스닥"
                     elif "KONEX" in mk or "코넥스" in mk:
-                        continue                      # 코넥스 제외
+                        continue
                     else:
-                        label = "코스피"              # KOSPI/유가증권/미상 → 코스피
-                    rows.append((nm, sym, label))
+                        label = "코스피"
+                    kr_rows.append((nm, sym, label))
         except Exception:
             pass
+
+        # --- 한국 2순위: DART corpCode (KRX가 비었을 때) ---
+        if not kr_rows and dart_key:
+            for nm, sym in _dart_stock_list(dart_key):
+                kr_rows.append((nm, sym, "한국"))
+
+        rows += kr_rows
 
         # --- 미국: 나스닥·NYSE·AMEX (S&P/다우/러셀 종목 포함) ---
         for market, label in [("NASDAQ", "나스닥"), ("NYSE", "NYSE"), ("AMEX", "AMEX")]:
@@ -717,6 +725,31 @@ def _dart_corp_code(stock_code, api_key):
         except Exception:
             return None
     return _DART_CORP.get(str(stock_code).zfill(6))
+
+
+_DART_STOCKS = None
+def _dart_stock_list(api_key):
+    """DART corpCode.xml에서 상장사(종목코드 보유) 이름+코드 목록. 클라우드에서도 안정적."""
+    global _DART_STOCKS
+    if _DART_STOCKS is not None:
+        return _DART_STOCKS
+    out = []
+    try:
+        import requests, zipfile, io
+        import xml.etree.ElementTree as ET
+        r = requests.get("https://opendart.fss.or.kr/api/corpCode.xml",
+                         params={"crtfc_key": api_key}, timeout=20)
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        root = ET.fromstring(zf.read(zf.namelist()[0]))
+        for el in root.iter("list"):
+            sc = (el.findtext("stock_code") or "").strip()
+            nm = (el.findtext("corp_name") or "").strip()
+            if sc and sc != " " and len(sc) == 6 and sc.isdigit() and nm:
+                out.append((nm, sc.zfill(6)))
+    except Exception:
+        pass
+    _DART_STOCKS = out
+    return out
 
 
 def _dart_accounts(corp, year, reprt_code, api_key):

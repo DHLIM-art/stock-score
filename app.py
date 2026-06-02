@@ -115,8 +115,8 @@ def sample_series(price):
 
 # ---------------------------------------------------------------- 사이드바
 @st.cache_data(ttl=86400, show_spinner="종목 목록 불러오는 중...")
-def load_universe():
-    uni = S.build_universe()
+def load_universe(dart_key):
+    uni = S.build_universe(dart_key=dart_key)
     labels = [f"{u['name']} ({u['symbol']}) · {u['market']}" for u in uni]
     mapping = {lab: u["symbol"] for lab, u in zip(labels, uni)}
     return labels, mapping
@@ -126,7 +126,7 @@ with st.sidebar:
 
     # 이름·티커로 검색해서 고르기 (코스피·코스닥·미국)
     try:
-        _uni_labels, _uni_map = load_universe()
+        _uni_labels, _uni_map = load_universe(st.session_state.get("dart_key", ""))
     except Exception:
         _uni_labels, _uni_map = [], {}
     if _uni_labels:
