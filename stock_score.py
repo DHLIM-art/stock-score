@@ -239,9 +239,8 @@ def fetch_fundamentals(ticker: str):
         fnd = stock.get_market_fundamental_by_date(ago, today, code)
         if fnd is not None and len(fnd):
             row = fnd.iloc[-1]
-            eps, bps = safe(row.get("EPS")), safe(row.get("BPS"))
-            if bps > 0:
-                out["roeAnnual"] = r1(eps / bps * 100)   # ROE ≈ EPS/BPS
+            # ROE는 pykrx EPS/BPS로 추정하지 않음(시점값이라 부정확).
+            # ROE는 DART(TTM)→네이버→yfinance 우선순위에서만 계산.
         try:
             nm = stock.get_market_ticker_name(code)
             if nm:

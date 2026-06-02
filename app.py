@@ -123,6 +123,7 @@ def load_universe(dart_key):
 
 with st.sidebar:
     st.markdown("### 종목 평가")
+    st.caption("엔진 v2026.06.02-ROE-TTM")
 
     # 이름·티커로 검색해서 고르기 (코스피·코스닥·미국)
     try:
