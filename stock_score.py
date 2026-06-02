@@ -265,10 +265,135 @@ def market_regime():
         return "NEUTRAL"
 
 
+_LISTING = {}  # KRX 종목명 목록 캐시 (프로세스 1회만 다운로드)
+
+def fetch_name(ticker: str):
+    """종목명을 여러 소스에서 시도: pykrx → FDR 종목목록 → yfinance."""
+    code = _norm_krx(ticker)
+    # 1) pykrx (로컬에선 빠름, 클라우드에선 막힐 수 있음)
+    try:
+        from pykrx import stock
+        nm = stock.get_market_ticker_name(code)
+        if nm and str(nm).strip():
+            return str(nm).strip()
+    except Exception:
+        pass
+    # 2) FinanceDataReader 종목 목록 (클라우드에서도 비교적 안정적)
+    try:
+        import FinanceDataReader as fdr
+        if "KRX" not in _LISTING:
+            _LISTING["KRX"] = fdr.StockListing("KRX")
+        lst = _LISTING["KRX"]
+        cc = "Code" if "Code" in lst.columns else ("Symbol" if "Symbol" in lst.columns else None)
+        nc = "Name" if "Name" in lst.columns else None
+        if cc and nc:
+            hit = lst[lst[cc].astype(str).str.zfill(6) == code]
+            if len(hit):
+                return str(hit.iloc[0][nc]).strip()
+    except Exception:
+        pass
+    # 3) yfinance
+    try:
+        import yfinance as yf
+        yt = ticker if ("." in ticker or not code.isdigit()) else code + ".KS"
+        info = yf.Ticker(yt).info
+        nm = info.get("shortName") or info.get("longName")
+        if nm:
+            return str(nm).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _to_num(x):
+    try:
+        s = str(x).replace(",", "").replace("%", "").strip()
+        if s in ("", "-", "nan", "N/A", "None"):
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def _parse_naver_fin(fin):
+    """네이버 '기업실적분석' 표 → (ROE, EPS성장률%)."""
+    roe = epsg = None
+    try:
+        cols = fin.columns
+        fin = fin.copy()
+        fin.columns = [(" ".join(map(str, c)) if isinstance(c, tuple) else str(c)) for c in cols]
+        label_col = fin.columns[0]
+        labels = fin[label_col].astype(str)
+
+        def row_vals(key):
+            idx = labels[labels.str.contains(key, na=False)].index
+            if len(idx) == 0:
+                return []
+            vals = [_to_num(v) for v in fin.loc[idx[0]].tolist()[1:]]
+            return [v for v in vals if v is not None]
+
+        rv = row_vals("ROE")
+        if rv:
+            roe = rv[-1]
+        ev = row_vals("EPS")
+        if len(ev) >= 2 and ev[-2] not in (0, None):
+            epsg = (ev[-1] - ev[-2]) / abs(ev[-2]) * 100
+    except Exception:
+        pass
+    return roe, epsg
+
+def fetch_naver(ticker: str):
+    """네이버 금융에서 ROE·EPS성장·증권사 목표주가 수집 (best-effort, 실패 시 빈 dict)."""
+    out, warns = {}, []
+    code = _norm_krx(ticker)
+    if not (code.isdigit() and len(code) == 6):
+        return out, warns  # 국내 6자리 종목만
+    try:
+        import requests
+        from io import StringIO
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get(f"https://finance.naver.com/item/main.naver?code={code}",
+                         headers=headers, timeout=8)
+        r.encoding = r.apparent_encoding or "euc-kr"
+        html = r.text
+        # 1) ROE / EPS 성장률
+        try:
+            for t in pd.read_html(StringIO(html)):
+                flat = " ".join(sum(t.astype(str).values.tolist(), []))
+                if "ROE" in flat and "EPS" in flat:
+                    roe, epsg = _parse_naver_fin(t)
+                    if roe is not None:
+                        out["roeAnnual"] = r1(roe)
+                    if epsg is not None:
+                        out["epsGrowthQoQ"] = r1(epsg)
+                        out["epsAccelQuarters"] = 2 if epsg > 0 else 0
+                    break
+        except Exception:
+            pass
+        # 2) 증권사 목표주가
+        try:
+            from bs4 import BeautifulSoup
+            text = BeautifulSoup(html, "lxml").get_text(" ")
+            import re
+            m = re.search(r"목표주가[^0-9]{0,8}([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})", text)
+            if m:
+                tp = _to_num(m.group(1))
+                if tp and tp > 0:
+                    out["targetPrice"] = tp
+        except Exception:
+            pass
+        if not out:
+            warns.append("네이버 재무/목표가 파싱 실패(페이지 구조 변경 가능). 추정값 사용.")
+    except Exception as e:
+        warns.append(f"네이버 접속 실패: {e}")
+    return out, warns
+
+
 def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 400):
     """ticker → 엔진 입력 dict + 차트 df + 경고 목록."""
     data = dict(DEFAULTS)
     data["ticker"] = ticker
+    data["name"] = ticker      # 이름을 못 가져오면 종목코드를 그대로 표시(오해 방지)
+    data["sector"] = ""
     warnings, chart_df = [], None
 
     df, w1 = fetch_ohlcv(ticker, period_days)
@@ -282,12 +407,31 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
     data.update(fnd)
     warnings += w2
 
-    # 자동 수집이 어려운 항목 → 합리적 추정 기본값
+    nm = fetch_name(ticker)    # 종목명 별도 다중 소스 조회
+    if nm:
+        data["name"] = nm
+
+    # 자동 수집이 어려운 항목 → 새 종목 기준 중립값으로 초기화
+    # (이렇게 안 하면 예시 종목(SK하이닉스) 값이 남아 점수/익절가가 안 바뀜)
     if df is not None:
-        data.setdefault("dcfFairValue", data["price"] * 1.2)
-        data.setdefault("targetPrice", data["price"] * 1.1)
-        # RS 등급 근사 (KOSPI 대비 12M 초과수익)
+        data["dcfFairValue"] = data["price"] * 1.1   # 보수적 추정(수동 보정 가능)
+        data["targetPrice"]  = data["price"] * 1.1   # 보수적 추정(수동 보정 가능)
+        data["factorAlpha"]  = 0.0                    # 가치·퀄리티 알파 미수집 → 중립
+        data["volMultiplier"] = 1.0                   # 변동성 배율 중립
+        data["epsGrowthQoQ"] = 0.0                    # EPS 성장 미수집 → 중립
+        data["epsAccelQuarters"] = 0
+        data["shortRatioPct"] = 0.0
+        if "roeAnnual" not in fnd:                    # pykrx ROE 실패 시 중립
+            data["roeAnnual"] = data["roeThreshold"]
+        # RS 등급 근사 (12M 수익률 기반)
         data["rsRating"] = int(clamp(round(60 + data.get("return12m", 0) * 0.05), 1, 99))
+
+        # 네이버 금융에서 ROE·EPS성장·목표주가 보강 (성공 시 위 중립값을 덮어씀)
+        nv, w3 = fetch_naver(ticker)
+        data.update(nv)
+        warnings += w3
+        if not nv:
+            warnings.append("DCF·목표가·EPS성장·ROE는 추정/중립값입니다. 실제 값은 사이드바에서 보정하세요.")
 
     if overrides:
         data.update({k: v for k, v in overrides.items() if v is not None})
