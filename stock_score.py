@@ -602,7 +602,143 @@ def fetch_yf_quarter_roe(ticker: str):
     return None
 
 
-def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 400):
+def fetch_yf_quarter_eps_growth(ticker: str):
+    """yfinance 분기 손익계산서에서 EPS(또는 순이익) 성장률 계산.
+    분기 YoY(4분기 전 대비) 우선, 없으면 분기 QoQ. 실패 시 None."""
+    try:
+        import yfinance as yf
+        for yt in _yf_candidates(ticker):
+            t = yf.Ticker(yt)
+            qf = getattr(t, "quarterly_income_stmt", None)
+            if qf is None or qf.empty:
+                qf = getattr(t, "quarterly_financials", None)
+            if qf is None or qf.empty:
+                continue
+            row = None
+            for nm in ["Diluted EPS", "Basic EPS", "Net Income",
+                       "Net Income Common Stockholders"]:
+                if nm in qf.index:
+                    s = qf.loc[nm].dropna()
+                    if len(s) >= 2:
+                        row = s
+                        break
+            if row is None:
+                continue
+            vals = [float(v) for v in row.values]   # 최신이 맨 앞
+            if len(vals) >= 5 and vals[4] not in (0, None):
+                return r1((vals[0] - vals[4]) / abs(vals[4]) * 100)   # 분기 YoY
+            if len(vals) >= 2 and vals[1] not in (0, None):
+                return r1((vals[0] - vals[1]) / abs(vals[1]) * 100)   # 분기 QoQ
+    except Exception:
+        pass
+    return None
+
+
+_DART_CORP = {}   # stock_code(6) → corp_code(8) 매핑 캐시
+
+def _dart_corp_code(stock_code, api_key):
+    """DART corpCode.xml(zip)을 1회 받아 종목코드→corp_code 매핑."""
+    if not _DART_CORP:
+        try:
+            import requests, zipfile, io
+            import xml.etree.ElementTree as ET
+            r = requests.get("https://opendart.fss.or.kr/api/corpCode.xml",
+                             params={"crtfc_key": api_key}, timeout=20)
+            zf = zipfile.ZipFile(io.BytesIO(r.content))
+            root = ET.fromstring(zf.read(zf.namelist()[0]))
+            for el in root.iter("list"):
+                sc = (el.findtext("stock_code") or "").strip()
+                cc = (el.findtext("corp_code") or "").strip()
+                if sc and cc and sc != " ":
+                    _DART_CORP[sc.zfill(6)] = cc
+        except Exception:
+            return None
+    return _DART_CORP.get(str(stock_code).zfill(6))
+
+
+def _dart_accounts(corp, year, reprt_code, api_key):
+    """단일회사 주요계정 → 당기순이익·자본총계·부채총계 (연결 CFS 우선, 없으면 별도 OFS)."""
+    try:
+        import requests
+        r = requests.get("https://opendart.fss.or.kr/api/fnlttSinglAcnt.json",
+                         params={"crtfc_key": api_key, "corp_code": corp,
+                                 "bsns_year": str(year), "reprt_code": reprt_code}, timeout=12)
+        j = r.json()
+        if j.get("status") != "000":
+            return None
+        rows = j.get("list", [])
+
+        def grab(names):
+            for fs in ("CFS", "OFS"):
+                for it in rows:
+                    if it.get("fs_div") == fs and it.get("account_nm", "").replace(" ", "") in names:
+                        v = _to_num(it.get("thstrm_amount"))
+                        if v is not None:
+                            return v
+            return None
+
+        out = {}
+        ni = grab({"당기순이익", "당기순이익(손실)"})
+        eq = grab({"자본총계"})
+        debt = grab({"부채총계"})
+        if ni is not None:
+            out["당기순이익"] = ni
+        if eq is not None:
+            out["자본총계"] = eq
+        if debt is not None:
+            out["부채총계"] = debt
+        return out or None
+    except Exception:
+        return None
+
+
+def fetch_dart(ticker, api_key):
+    """DART 공시에서 ROE(분기 연환산)·부채비율·순이익 YoY 성장 수집."""
+    out, warns = {}, []
+    code = _norm_krx(ticker)
+    if not api_key or not (code.isdigit() and len(code) == 6):
+        return out, warns
+    corp = _dart_corp_code(code, api_key)
+    if not corp:
+        warns.append("DART: 종목코드에 맞는 회사를 못 찾았어요(키 오류이거나 비상장).")
+        return out, warns
+    import datetime
+    y = datetime.date.today().year
+    # (사업연도, 보고서코드, 연환산배수, 라벨) — 최신 보고서부터 탐색
+    candidates = [
+        (y, "11014", 4 / 3, "3분기"), (y, "11012", 2.0, "반기"), (y, "11013", 4.0, "1분기"),
+        (y - 1, "11011", 1.0, "연간"), (y - 1, "11014", 4 / 3, "전년3분기"),
+        (y - 1, "11012", 2.0, "전년반기"),
+    ]
+    picked = None
+    for (by, rc, ann, lab) in candidates:
+        accts = _dart_accounts(corp, by, rc, api_key)
+        if accts and accts.get("자본총계"):
+            picked = (by, rc, ann, lab, accts)
+            break
+    if not picked:
+        warns.append("DART: 재무 데이터를 받지 못했어요.")
+        return out, warns
+    by, rc, ann, lab, accts = picked
+    ni, eq, debt = accts.get("당기순이익"), accts.get("자본총계"), accts.get("부채총계")
+    if ni is not None and eq:
+        roe = r1(ni * ann / eq * 100)        # 분기 누적 순이익 → 연환산 ROE
+        out["roeAnnual"] = roe
+        out["roeQuarter"] = roe
+    if debt is not None and eq:
+        out["debtRatio"] = r1(debt / eq * 100)
+    # 순이익 YoY: 같은 보고서코드의 전년도와 비교 → EPS 성장 대용
+    prev = _dart_accounts(corp, by - 1, rc, api_key)
+    if prev and ni is not None:
+        pni = prev.get("당기순이익")
+        if pni not in (None, 0):
+            out["epsGrowthQoQ"] = r1((ni - pni) / abs(pni) * 100)
+            out["epsAccelQuarters"] = 2 if out["epsGrowthQoQ"] > 0 else 0
+    out["_dartLabel"] = f"{by} {lab}"
+    return out, warns
+
+
+def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 400, dart_key: str | None = None):
     """ticker(코드 또는 정확한 종목명) → 엔진 입력 dict + 차트 df + 경고 목록."""
     resolved, rwarn = resolve_ticker(ticker)
     data = dict(DEFAULTS)
@@ -643,19 +779,22 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
         # RS 등급 근사 (12M 수익률 기반)
         data["rsRating"] = int(clamp(round(60 + data.get("return12m", 0) * 0.05), 1, 99))
 
-        # 펀더멘털: 네이버 → yfinance(미국 야후, 클라우드에서 더 안정적) → 중립값 순
+        # 펀더멘털: DART(공식 공시) → 네이버 → yfinance → 중립값 순
+        dt, wdt = (fetch_dart(ticker, dart_key) if dart_key else ({}, []))
+        warnings += wdt
         nv, w3 = fetch_naver(ticker)
         warnings += w3
         yf_f, w5 = fetch_yf_fundamentals(ticker)
         warnings += w5
 
+        sources = [(dt, "DART(공시)"), (nv, "네이버(최근분기)"), (yf_f, "yfinance(TTM·연간)")]
+
         def fill(key, neutral):
-            if key in nv:
-                data[key] = nv[key]          # 1순위: 네이버
-            elif key in yf_f:
-                data[key] = yf_f[key]        # 2순위: yfinance
-            else:
-                data[key] = neutral          # 3순위: 중립값
+            for src, _ in sources:
+                if key in src:
+                    data[key] = src[key]
+                    return
+            data[key] = neutral
 
         fill("roeAnnual", data["roeThreshold"])
         fill("per", 15.0)
@@ -669,23 +808,35 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
                    "dividendYield": "배당", "debtRatio": "부채비율", "epsGrowthQoQ": "EPS성장"}
         srcmap = {}
         for key, lab in _LABELS.items():
-            if key in nv:
-                srcmap[lab] = "네이버(최근분기)"
-            elif key in yf_f:
-                srcmap[lab] = "yfinance(TTM·연간)"
-            else:
-                srcmap[lab] = "기본값(중립)"
+            chosen = "기본값(중립)"
+            for src, label in sources:
+                if key in src:
+                    chosen = label
+                    break
+            srcmap[lab] = chosen
         data["_src"] = srcmap
 
-        # 가장 최근 발표 분기 ROE(연환산) 추가 — TTM과 함께 점수에 반영
-        roeQ = fetch_yf_quarter_roe(ticker)
-        data["roeQuarter"] = roeQ
-        if roeQ is not None:
-            srcmap["ROE(분기)"] = "yfinance(최근분기 연환산)"
+        # 분기 ROE(연환산): DART 우선 → yfinance 분기 재무제표
+        if "roeQuarter" in dt:
+            data["roeQuarter"] = dt["roeQuarter"]
+            srcmap["ROE(분기)"] = "DART(공시)"
+        else:
+            roeQ = fetch_yf_quarter_roe(ticker)
+            data["roeQuarter"] = roeQ
+            if roeQ is not None:
+                srcmap["ROE(분기)"] = "yfinance(최근분기 연환산)"
+
+        # EPS 성장이 DART·네이버·yfinance(.info) 모두 없으면 → 분기 재무제표로 직접 계산
+        if not any("epsGrowthQoQ" in s for s, _ in sources):
+            g2 = fetch_yf_quarter_eps_growth(ticker)
+            if g2 is not None:
+                data["epsGrowthQoQ"] = g2
+                data["epsAccelQuarters"] = 2 if g2 > 0 else 0
+                srcmap["EPS성장"] = "yfinance(분기 재무제표)"
 
         # EPS 가속 분기수 / 목표주가는 출처 dict에서 따라옴
-        src = nv if "epsGrowthQoQ" in nv else (yf_f if "epsGrowthQoQ" in yf_f else {})
-        data["epsAccelQuarters"] = src.get("epsAccelQuarters", 2 if data["epsGrowthQoQ"] > 0 else 0)
+        esrc = next((s for s, _ in sources if "epsGrowthQoQ" in s), {})
+        data["epsAccelQuarters"] = esrc.get("epsAccelQuarters", 2 if data["epsGrowthQoQ"] > 0 else 0)
         if "targetPrice" in nv:
             data["targetPrice"] = nv["targetPrice"]
         elif "targetPrice" in yf_f:
@@ -700,7 +851,7 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
         data.update(mac)
         warnings += w4
 
-        if not nv and not yf_f:
+        if not dt and not nv and not yf_f:
             warnings.append("ROE·EPS성장·PER·PBR·배당은 자동수집이 안 돼 중립값입니다. 사이드바에서 직접 보정하세요.")
 
     if overrides:
@@ -739,7 +890,7 @@ METRICS = [
                             f" → 반영 ROE {r1(_roe_eff(d))}% (기준 {r1(d['roeThreshold'])}%). " +
                             ("기준 통과예요." if _roe_eff(d) >= d["roeThreshold"] else "기준 미달이에요."))),
     dict(tag="N", title="신고가·피벗 돌파", sub="52주 최고가 및 패턴 돌파",
-         score=lambda d: clamp(95 - _distHigh(d)*3.5 + (5 if d["pivotBreak"] else 0)),
+         score=lambda d: clamp(90 - _distHigh(d)*2.0 + (6 if d["pivotBreak"] else 0)),
          comment=lambda d: f"52주 최고가에서 {r1(_distHigh(d))}% 아래에 있어요. " +
                            ("아직 신고가까지 거리가 있어요. " if _distHigh(d) > 3 else "신고가 부근이에요. ") +
                            ("컵앤핸들 피벗 돌파가 감지됐어요." if d["pivotBreak"] else "")),
@@ -774,8 +925,8 @@ METRICS = [
          score=lambda d: clamp(40 + d["alignedTimeframes"]*20),
          comment=lambda d: f"단기·중기·장기 추세 종합: {'상승' if d['alignedTimeframes']>=2 else '혼조'} 추세예요 (정렬 {d['alignedTimeframes']}/3)."),
     dict(tag="Quant", title="낙폭 위험도", sub="최근 최대 하락폭(MDD) 평가",
-         score=lambda d: clamp(100 - abs(d["mddPct"])*4),
-         comment=lambda d: f"최근 최대 낙폭(MDD) {r1(d['mddPct'])}%이에요. 위험도는 '{'낮음' if abs(d['mddPct'])<10 else '보통' if abs(d['mddPct'])<20 else '높음'}'으로 평가돼요."),
+         score=lambda d: clamp(95 - abs(d["mddPct"])*1.5),
+         comment=lambda d: f"최근 최대 낙폭(MDD) {r1(d['mddPct'])}%이에요. 위험도는 '{'낮음' if abs(d['mddPct'])<15 else '보통' if abs(d['mddPct'])<30 else '높음'}'으로 평가돼요."),
     dict(tag="Quant", title="스마트머니 흐름", sub="기관 자금 흐름과 OBV 추세",
          score=lambda d: _OBV.get(d["obvTrend"], 50),
          comment=lambda d: "스마트머니 흐름 — OBV 추세: " + {"up": "상승", "flat": "횡보", "down": "하락"}.get(d["obvTrend"], "횡보") + "이에요."),

@@ -59,7 +59,9 @@ def do_load():
     ticker = (st.session_state.get("tk_input") or "").strip()
     if not ticker:
         return
-    base, df, warns = S.build_inputs(ticker, period_days=int(st.session_state.get("period", 400)))
+    base, df, warns = S.build_inputs(
+        ticker, period_days=int(st.session_state.get("period", 400)),
+        dart_key=(st.session_state.get("dart_key") or "").strip() or None)
     st.session_state.base = base
     st.session_state.df = df
     st.session_state.warns = warns
@@ -80,6 +82,10 @@ if "base" not in st.session_state:
     st.session_state.cmp_codes = ""
     st.session_state.peer_warn = []
     st.session_state.history = []
+    try:
+        st.session_state.dart_key = st.secrets.get("DART_API_KEY", "")
+    except Exception:
+        st.session_state.dart_key = ""
     for k in EDITABLE:
         st.session_state[k] = S.DEFAULTS[k]
     # 첫 진입 시 삼성전자를 자동으로 불러오기
@@ -128,6 +134,11 @@ with st.sidebar:
 
     st.slider("데이터 기간(일)", 200, 700, step=50, key="period")
     st.button("📡 실데이터 불러오기", use_container_width=True, type="primary", on_click=do_load)
+
+    with st.expander("🔑 DART 연동 (정확한 한국 재무)"):
+        st.text_input("DART API 키", key="dart_key", type="password",
+                      help="opendart.fss.or.kr 에서 무료 발급. 입력 후 다시 불러오면 ROE·부채·순이익을 공시 기준으로 사용해요.")
+        st.caption("키를 넣으면 ROE·부채비율·순이익성장이 금감원 공시(분기) 기준으로 계산됩니다.")
 
     if st.session_state.fetched:
         if st.session_state.df is not None:
