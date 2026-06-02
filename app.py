@@ -102,8 +102,8 @@ def sample_series(price):
 # ---------------------------------------------------------------- 사이드바
 with st.sidebar:
     st.markdown("### 종목 평가")
-    st.text_input("종목코드 / 티커  (입력 후 Enter)", key="tk_input", on_change=do_load,
-                  help="국내: 6자리 코드(예 000660) · 해외: 티커(예 AAPL)")
+    st.text_input("종목코드 또는 종목명  (입력 후 Enter)", key="tk_input", on_change=do_load,
+                  help="6자리 코드(예 005930) · 정확한 종목명(예 삼성전자) · 해외 티커(예 AAPL)")
     st.slider("데이터 기간(일)", 200, 700, step=50, key="period")
     st.button("📡 실데이터 불러오기", use_container_width=True, type="primary", on_click=do_load)
 
@@ -163,7 +163,7 @@ mode = st.radio("보기 모드", ["📊 단일 종목 분석", "⚖️ 동종업
 # ================================================================ 동종업계 비교 (독립 화면)
 if mode == "⚖️ 동종업계 비교":
     st.markdown("## ⚖️ 동종업계 비교")
-    st.caption("기준 종목의 동일업종을 자동으로 불러오거나, 코드를 직접 콤마로 입력하세요 (최대 8개).")
+    st.caption("기준 종목의 동일업종을 자동으로 불러오거나, 코드·정확한 종목명을 콤마로 입력하세요 (최대 8개). 예: 삼성전자, 000660, SK하이닉스")
 
     def autofill_peers():
         base = (st.session_state.get("cmp_codes", "") or st.session_state.get("tk_input", "")).split(",")[0].strip()
@@ -351,41 +351,79 @@ def grid(metrics):
     st.markdown("<div class='grid'>" + "".join(card_html(m) for m in metrics) + "</div>",
                 unsafe_allow_html=True)
 
+def status_word(v):
+    return ("강함" if v >= 80 else "양호" if v >= 60 else "보통" if v >= 40
+            else "주의" if v >= 20 else "약함")
+
+def mval(title):
+    return next((m["value"] for m in res["metrics"] if m["title"] == title), 0)
+
+def summary_badge_rows(items):
+    """items: [(badge, desc, score), ...] → 점수 색으로 칠한 요약 행들."""
+    out = ""
+    for badge, desc, v in items:
+        c = scol(v)
+        out += (f"<div style='display:flex;align-items:center;gap:10px;padding:7px 10px;"
+                f"border-left:3px solid {c};margin-bottom:4px;background:#fafcff'>"
+                f"<span style='width:20px;height:20px;border-radius:5px;background:{c};color:#fff;"
+                f"font-size:11px;font-weight:800;display:grid;place-items:center'>{badge}</span>"
+                f"<span style='flex:1;font-size:12.5px;color:#334155'>{desc}</span>"
+                f"<b style='color:{c};font-size:12.5px'>{v}</b>"
+                f"<span style='font-size:10.5px;color:{SLATE};width:30px;text-align:right'>{status_word(v)}</span>"
+                f"</div>")
+    return out
+
+def summary_card(heading, items):
+    st.markdown(
+        f"<div class='card'><div style='text-align:center;font-weight:800;color:{SLATE};"
+        f"margin-bottom:10px'>═══ {heading} ═══</div>{summary_badge_rows(items)}</div>",
+        unsafe_allow_html=True)
+
+def metric_summary(heading, metrics):
+    """METRICS 항목 리스트를 그대로 요약(아이콘=●, 제목, 점수, 상태)."""
+    items = [("●", m["title"], m["value"]) for m in metrics]
+    summary_card(heading, items)
+
 with right:
     t1, t2, t3, t4, t5, t6 = st.tabs(
         ["CAN SLIM 분석", "가치투자", "모멘텀·기술", "매크로", "재무 지표", "공시·뉴스"])
     with t1:
-        canslim = [
-            ("C", f"분기 실적이 {d['epsAccelQuarters']}분기 연속 가속 성장 중이에요", GREEN),
-            ("A", f"자기자본이익률 {S.r1(d['roeAnnual'])}%가 기준({S.r1(d['roeThreshold'])}%)을 통과했어요", GREEN),
-            ("N", f"52주 최고가에서 {res['distHigh']}% 이내에 위치했어요", GREEN),
-            ("N", f"컵앤핸들 패턴의 피벗을 {'돌파했어요' if d['pivotBreak'] else '관찰 중이에요'}", GREEN if d['pivotBreak'] else ORANGE),
-            ("S", f"거래량이 평소의 {S.r1(d['volumeRatioVsAvg'])}배 수준이에요", GREEN),
-            ("L", f"상대강도 {int(d['rsRating'])}점으로 시장 주도주에요", GREEN),
-            ("I", f"기관 자금 흐름은 '{'매수' if d['mfi']>=80 else '관망'}'이에요", SLATE),
+        cs = [
+            ("C", "EPS 가속도", f"분기 순이익 {S.r1(d['epsGrowthQoQ'])}% · {d['epsAccelQuarters']}분기 가속"),
+            ("A", "연간 ROE 실적", f"ROE {S.r1(d['roeAnnual'])}% (기준 {S.r1(d['roeThreshold'])}%)"),
+            ("N", "신고가·피벗 돌파", f"52주 고점 -{res['distHigh']}% · 피벗 {'돌파' if d['pivotBreak'] else '관찰'}"),
+            ("S", "거래량 확인 돌파", f"거래량 평소의 {S.r1(d['volumeRatioVsAvg'])}배"),
+            ("L", "주도주 판별", f"상대강도(RS) {int(d['rsRating'])}점"),
+            ("I", "기관 수급", f"MFI {int(d['mfi'])} · {'매수 우위' if d['mfi']>=80 else '관망'}"),
+            ("M", "시장 방향", f"시장 국면 {d['marketRegime']}"),
         ]
-        rows = "".join(
-            f"<div style='display:flex;align-items:center;gap:10px;padding:7px 10px;"
-            f"border-left:3px solid {c};margin-bottom:4px;background:#fafcff'>"
-            f"<span style='width:18px;height:18px;border-radius:5px;background:#f1f5f9;color:{SLATE};"
-            f"font-size:11px;font-weight:800;display:grid;place-items:center'>{t}</span>"
-            f"<span style='font-size:12.5px;color:#334155'>{txt}</span></div>" for t, txt, c in canslim)
-        st.markdown(f"<div class='card'><div style='text-align:center;font-weight:800;color:{SLATE};"
-                    f"margin-bottom:10px'>═══ CAN SLIM 원칙 요약 ═══</div>{rows}</div>", unsafe_allow_html=True)
+        summary_card("CAN SLIM 원칙 요약",
+                     [(badge, desc, mval(title)) for badge, title, desc in cs])
         st.write("")
         grid([m for m in res["metrics"] if m["tag"] in ("C", "A", "N", "S", "L", "I", "M")])
     with t2:
         st.caption(f"가치투자 종합: {res['styles']['가치']}점 — 저평가·재무안정·배당·안전마진 관점")
+        metric_summary("가치투자 요약", [m for m in res["metrics"] if m["tag"] == "Value"])
+        st.write("")
         grid([m for m in res["metrics"] if m["tag"] == "Value"])
     with t3:
+        st.caption(f"모멘텀 종합: {res['styles']['모멘텀']}점 — 추세·상대강도·기술적 신호")
+        metric_summary("모멘텀·기술 요약", [m for m in res["metrics"] if m["tag"] in ("Quant", "Math")])
+        st.write("")
         grid([m for m in res["metrics"] if m["tag"] in ("Quant", "Math")])
     with t4:
         st.caption(f"매크로(시장 환경) 종합: {res['styles']['매크로']}점 — 종목 무관 시장 전반")
+        metric_summary("매크로 요약", [m for m in res["metrics"] if m["tag"] == "Macro"])
+        st.write("")
         grid([m for m in res["metrics"] if m["tag"] == "Macro"])
     with t5:
-        grid([m for m in res["metrics"] if m["title"] in
-              ("EPS 가속도", "연간 ROE 실적", "가치·퀄리티 팩터", "DCF 적정가",
-               "PER 밸류", "PBR 밸류", "재무 안정성")])
+        fin_titles = ("EPS 가속도", "연간 ROE 실적", "가치·퀄리티 팩터", "DCF 적정가",
+                      "PER 밸류", "PBR 밸류", "재무 안정성")
+        fin = [m for m in res["metrics"] if m["title"] in fin_titles]
+        st.caption(f"퀄리티 종합: {res['styles']['퀄리티']}점 — 수익성·밸류·재무 건전성")
+        metric_summary("재무 지표 요약", fin)
+        st.write("")
+        grid(fin)
     with t6:
         sm = next(m for m in res["metrics"] if m["title"] == "시장 심리 추정")
         st.markdown(f"<div class='card' style='line-height:1.7;font-size:13px;color:{SLATE}'>"

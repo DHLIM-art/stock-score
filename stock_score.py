@@ -335,6 +335,34 @@ def fetch_name(ticker: str):
     return None
 
 
+def resolve_ticker(query: str):
+    """입력을 종목코드로 변환. 6자리코드/해외티커는 그대로, 한글 종목명은 '정확히 일치'할 때만 코드로.
+    반환: (코드 또는 None, 경고 또는 None)."""
+    q = (query or "").strip()
+    if not q:
+        return q, None
+    code = _norm_krx(q)
+    if code.isdigit() and len(code) == 6:          # 이미 6자리 코드
+        return code, None
+    # KRX 종목목록에서 종목명 정확 일치 검색
+    try:
+        import FinanceDataReader as fdr
+        if "KRX" not in _LISTING:
+            _LISTING["KRX"] = fdr.StockListing("KRX")
+        lst = _LISTING["KRX"]
+        nc = "Name" if "Name" in lst.columns else None
+        cc = "Code" if "Code" in lst.columns else ("Symbol" if "Symbol" in lst.columns else None)
+        if nc and cc:
+            hit = lst[lst[nc].astype(str).str.strip() == q]   # 대소문자·공백 그대로 정확 일치
+            if len(hit):
+                return str(hit.iloc[0][cc]).zfill(6), None
+    except Exception:
+        pass
+    if any("가" <= ch <= "힣" for ch in q):          # 한글인데 못 찾음
+        return None, f"'{q}'와 정확히 일치하는 종목명을 찾지 못했어요. 정확한 종목명 또는 6자리 코드를 입력하세요."
+    return q, None                                    # 영문 → 해외 티커로 간주, 그대로 사용
+
+
 def _to_num(x):
     try:
         s = str(x).replace(",", "").replace("%", "").strip()
@@ -453,9 +481,54 @@ def fetch_naver(ticker: str):
     return out, warns
 
 
+def fetch_yf_fundamentals(ticker: str):
+    """yfinance(.info)에서 ROE·PER·PBR·배당·부채·EPS성장·목표주가 보강.
+    미국 기반 클라우드(예: Streamlit Cloud)에서 네이버보다 안정적일 때가 많음."""
+    out, warns = {}, []
+    code = _norm_krx(ticker)
+    yt = ticker if ("." in ticker or not code.isdigit()) else code + ".KS"
+    try:
+        import yfinance as yf
+        info = getattr(yf.Ticker(yt), "info", None) or {}
+        roe = info.get("returnOnEquity")
+        if roe is not None:
+            out["roeAnnual"] = r1(roe * 100)
+        per = info.get("trailingPE") or info.get("forwardPE")
+        if per and per > 0:
+            out["per"] = r1(per)
+        pbr = info.get("priceToBook")
+        if pbr and pbr > 0:
+            out["pbr"] = r1(pbr)
+        dy = info.get("dividendYield")
+        if dy is not None:
+            out["dividendYield"] = r1(dy * 100 if dy < 1 else dy)   # 0.012 → 1.2%
+        de = info.get("debtToEquity")
+        if de is not None:
+            out["debtRatio"] = r1(de)
+        g = info.get("earningsQuarterlyGrowth")
+        if g is None:
+            g = info.get("earningsGrowth")
+        if g is not None:
+            out["epsGrowthQoQ"] = r1(g * 100)
+            out["epsAccelQuarters"] = 2 if g > 0 else 0
+        tp = info.get("targetMeanPrice")
+        if tp:
+            out["targetPrice"] = float(tp)
+    except Exception as e:
+        warns.append(f"yfinance 펀더멘털 생략: {e}")
+    return out, warns
+
+
 def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 400):
-    """ticker → 엔진 입력 dict + 차트 df + 경고 목록."""
+    """ticker(코드 또는 정확한 종목명) → 엔진 입력 dict + 차트 df + 경고 목록."""
+    resolved, rwarn = resolve_ticker(ticker)
     data = dict(DEFAULTS)
+    if not resolved:                       # 종목명을 못 찾음
+        data["ticker"] = ticker
+        data["name"] = ticker
+        data["sector"] = ""
+        return data, None, [rwarn] if rwarn else ["종목을 찾지 못했어요."]
+    ticker = resolved
     data["ticker"] = ticker
     data["name"] = ticker      # 이름을 못 가져오면 종목코드를 그대로 표시(오해 방지)
     data["sector"] = ""
@@ -483,24 +556,38 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
         data["targetPrice"]  = data["price"] * 1.1   # 보수적 추정(수동 보정 가능)
         data["factorAlpha"]  = 0.0                    # 가치·퀄리티 알파 미수집 → 중립
         data["volMultiplier"] = 1.0                   # 변동성 배율 중립
-        data["epsGrowthQoQ"] = 0.0                    # EPS 성장 미수집 → 중립
-        data["epsAccelQuarters"] = 0
         data["shortRatioPct"] = 0.0
-        if "roeAnnual" not in fnd:                    # pykrx ROE 실패 시 중립
-            data["roeAnnual"] = data["roeThreshold"]
         # RS 등급 근사 (12M 수익률 기반)
         data["rsRating"] = int(clamp(round(60 + data.get("return12m", 0) * 0.05), 1, 99))
 
-        # 네이버 금융에서 ROE·EPS성장·PER·PBR·배당·부채·목표주가 보강
+        # 펀더멘털: 네이버 → yfinance(미국 야후, 클라우드에서 더 안정적) → 중립값 순
         nv, w3 = fetch_naver(ticker)
-        data.update(nv)
         warnings += w3
+        yf_f, w5 = fetch_yf_fundamentals(ticker)
+        warnings += w5
 
-        # 가치지표: 네이버에서 못 받은 항목은 중립값으로 (예시값이 남지 않도록)
-        if "per" not in nv: data["per"] = 15.0
-        if "pbr" not in nv: data["pbr"] = 1.5
-        if "dividendYield" not in nv: data["dividendYield"] = 0.0
-        if "debtRatio" not in nv: data["debtRatio"] = 80.0
+        def fill(key, neutral):
+            if key in nv:
+                data[key] = nv[key]          # 1순위: 네이버
+            elif key in yf_f:
+                data[key] = yf_f[key]        # 2순위: yfinance
+            else:
+                data[key] = neutral          # 3순위: 중립값
+
+        fill("roeAnnual", data["roeThreshold"])
+        fill("per", 15.0)
+        fill("pbr", 1.5)
+        fill("dividendYield", 0.0)
+        fill("debtRatio", 80.0)
+        fill("epsGrowthQoQ", 0.0)
+        # EPS 가속 분기수 / 목표주가는 출처 dict에서 따라옴
+        src = nv if "epsGrowthQoQ" in nv else (yf_f if "epsGrowthQoQ" in yf_f else {})
+        data["epsAccelQuarters"] = src.get("epsAccelQuarters", 2 if data["epsGrowthQoQ"] > 0 else 0)
+        if "targetPrice" in nv:
+            data["targetPrice"] = nv["targetPrice"]
+        elif "targetPrice" in yf_f:
+            data["targetPrice"] = yf_f["targetPrice"]
+
         # PEG = PER / (EPS성장률) — 성장 대비 밸류
         g = data.get("epsGrowthQoQ", 0)
         data["pegRatio"] = r1(data["per"] / g) if g and g > 0 else 3.0
@@ -510,8 +597,8 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
         data.update(mac)
         warnings += w4
 
-        if not nv:
-            warnings.append("DCF·목표가·PER·PBR·배당·ROE는 추정/중립값입니다. 실제 값은 사이드바에서 보정하세요.")
+        if not nv and not yf_f:
+            warnings.append("ROE·EPS성장·PER·PBR·배당은 자동수집이 안 돼 중립값입니다. 사이드바에서 직접 보정하세요.")
 
     if overrides:
         data.update({k: v for k, v in overrides.items() if v is not None})
@@ -720,9 +807,10 @@ def compute_all(d: dict) -> dict:
 # ----------------------------------------------------------------------------
 def fetch_peers(ticker: str, limit: int = 5):
     """네이버 금융 '동일업종비교'에서 같은 업종 종목코드 수집 (best-effort)."""
-    code = _norm_krx(ticker)
-    if not (code.isdigit() and len(code) == 6):
-        return [], ["국내 6자리 종목코드만 동일업종 자동 탐색이 됩니다."]
+    code, rwarn = resolve_ticker(ticker)
+    if not code or not (str(code).isdigit() and len(str(code)) == 6):
+        return [], [rwarn] if rwarn else ["국내 6자리 종목코드/정확한 종목명만 동일업종 탐색이 됩니다."]
+    code = str(code)
     try:
         import requests, re
         from bs4 import BeautifulSoup
