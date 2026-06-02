@@ -380,27 +380,49 @@ def build_universe():
     rows = []
     try:
         import FinanceDataReader as fdr
-        specs = [("KOSPI", "코스피"), ("KOSDAQ", "코스닥"),
-                 ("NASDAQ", "나스닥"), ("NYSE", "NYSE"), ("AMEX", "AMEX")]
-        for market, label in specs:
+
+        # --- 한국: KRX 전체 목록에서 Market 으로 코스피/코스닥 분리 (가장 안정적) ---
+        try:
+            krx = fdr.StockListing("KRX")
+            cc = "Code" if "Code" in krx.columns else ("Symbol" if "Symbol" in krx.columns else None)
+            nc = "Name" if "Name" in krx.columns else None
+            mc = "Market" if "Market" in krx.columns else None
+            if cc and nc:
+                codes = krx[cc].astype(str)
+                names = krx[nc].astype(str)
+                mkts = krx[mc].astype(str) if mc else ["" for _ in range(len(krx))]
+                for sym, nm, mk in zip(codes, names, mkts):
+                    sym, nm, mk = sym.strip().zfill(6), nm.strip(), str(mk).upper()
+                    if not nm or nm.lower() == "nan" or not sym.isdigit():
+                        continue
+                    if "KOSDAQ" in mk or "코스닥" in mk:
+                        label = "코스닥"
+                    elif "KONEX" in mk or "코넥스" in mk:
+                        continue                      # 코넥스 제외
+                    else:
+                        label = "코스피"              # KOSPI/유가증권/미상 → 코스피
+                    rows.append((nm, sym, label))
+        except Exception:
+            pass
+
+        # --- 미국: 나스닥·NYSE·AMEX (S&P/다우/러셀 종목 포함) ---
+        for market, label in [("NASDAQ", "나스닥"), ("NYSE", "NYSE"), ("AMEX", "AMEX")]:
             try:
                 lst = fdr.StockListing(market)
                 cc = "Symbol" if "Symbol" in lst.columns else ("Code" if "Code" in lst.columns else None)
                 nc = "Name" if "Name" in lst.columns else None
                 if not cc or not nc:
                     continue
-                kr = market in ("KOSPI", "KOSDAQ")
                 for sym, nm in zip(lst[cc].astype(str), lst[nc].astype(str)):
                     sym, nm = sym.strip(), nm.strip()
                     if not sym or not nm or nm.lower() == "nan":
                         continue
-                    if kr:
-                        sym = sym.zfill(6)
                     rows.append((nm, sym, label))
             except Exception:
                 continue
     except Exception:
         pass
+
     seen, uni = set(), []
     for nm, sym, mk in rows:
         if sym in seen:
