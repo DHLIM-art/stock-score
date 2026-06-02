@@ -672,8 +672,10 @@ def fetch_yf_quarter_roe(ticker: str):
                         break
             if ni_row is None or not eq or eq <= 0:
                 continue
-            vals = [float(v) for v in ni_row.values[:4]]   # 최근 최대 4개 분기
-            ttm_ni = sum(vals) * (4.0 / len(vals))         # 4개면 그대로 TTM, 적으면 연환산
+            vals = [float(v) for v in ni_row.values if v == v][:4]  # NaN 제거, 최근 4개
+            if len(vals) < 4:
+                continue                                   # 4개 미만이면 TTM 불가 → 연환산 안 함
+            ttm_ni = sum(vals)                             # 최근 4개 분기 합 = 정확한 TTM
             return r1(ttm_ni / eq * 100)
     except Exception:
         pass
@@ -836,8 +838,7 @@ def fetch_dart(ticker, api_key):
             pan = prev_annual.get("당기순이익") if prev_annual else None
             if psn is not None and pan is not None:
                 ttm_ni = ni + pan - psn          # 정확한 TTM
-            else:
-                ttm_ni = ni * ann                # 폴백: 누적분 연환산
+            # 전년 자료를 못 받으면 TTM 계산 불가 → ROE 생략(다른 소스/중립에 맡김)
     if ttm_ni is not None and eq:
         out["roeAnnual"] = r1(ttm_ni / eq * 100)  # TTM ROE
     if debt is not None and eq:
