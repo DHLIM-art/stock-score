@@ -1,0 +1,452 @@
+# -*- coding: utf-8 -*-
+"""
+stock_score.py  —  매수 평가 점수 엔진 (Windows PC 버전)
+==========================================================
+- CAN SLIM + 퀀트 팩터 + 수학 지표(허스트/칼만/Z-Score) + 심리
+- 점수 공식은 웹(React) 버전과 동일합니다.  METRICS 배열만 고치면 기준이 바뀝니다.
+- 데이터는 FinanceDataReader / pykrx / yfinance 에서 자동 수집하며,
+  수집 실패 시 기본값을 쓰고 app.py 사이드바에서 수동 보정할 수 있습니다.
+
+단독 실행:  python stock_score.py 000660
+"""
+from __future__ import annotations
+import math
+import sys
+import numpy as np
+import pandas as pd
+
+# ----------------------------------------------------------------------------
+# 유틸
+# ----------------------------------------------------------------------------
+def clamp(x, lo=0.0, hi=100.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except (TypeError, ValueError):
+        return lo
+
+def r1(x):
+    try:
+        return round(float(x), 1)
+    except (TypeError, ValueError):
+        return 0.0
+
+def safe(x, default=0.0):
+    try:
+        v = float(x)
+        return default if (math.isnan(v) or math.isinf(v)) else v
+    except (TypeError, ValueError):
+        return default
+
+
+# ----------------------------------------------------------------------------
+# 기본 입력값 (수집 실패 시 사용 / SK하이닉스 예시값)
+# ----------------------------------------------------------------------------
+DEFAULTS = dict(
+    ticker="000660", name="SK하이닉스", sector="HBM·낸드",
+    price=1819000.0, changePct=-7.66, high52w=1995000.0, low52w=175400.0,
+    rsi=71.8, volumeRatioVsAvg=1.5, breakoutSignal=False, pivotBreak=True,
+    roeAnnual=61.0, roeThreshold=17.0, epsGrowthQoQ=396.6, epsAccelQuarters=2,
+    rsRating=99, return12m=930.8, mddPct=-8.0,
+    zScoreMeanRev=2.1, zScoreStat=1.2, hurst=0.76, adx=50.0, mfi=70.0,
+    shortRatioPct=0.0, dcfFairValue=3179188.0, targetPrice=2003200.0,
+    factorAlpha=12.8, alignedTimeframes=3, obvTrend="up", vwapPosition="above",
+    marketRegime="STRONG_BULL", kalmanSignal="neutral",
+    upVolPct=60.0, closeStrength=57.0, gapDir=1, volMultiplier=1.18, atr=95000.0,
+)
+
+
+# ----------------------------------------------------------------------------
+# 기술적 지표 계산 (pandas/numpy 만 사용)
+# ----------------------------------------------------------------------------
+def ema(s, span):
+    return s.ewm(span=span, adjust=False).mean()
+
+def rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    ag = gain.ewm(alpha=1/period, adjust=False).mean()
+    al = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = ag / al.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+def adx(high, low, close, period=14):
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    tr = pd.concat([high - low,
+                    (high - close.shift()).abs(),
+                    (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr_ = tr.ewm(alpha=1/period, adjust=False).mean()
+    pdi = 100 * pd.Series(plus_dm, index=close.index).ewm(alpha=1/period, adjust=False).mean() / atr_
+    mdi = 100 * pd.Series(minus_dm, index=close.index).ewm(alpha=1/period, adjust=False).mean() / atr_
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return dx.ewm(alpha=1/period, adjust=False).mean()
+
+def atr(high, low, close, period=14):
+    tr = pd.concat([high - low,
+                    (high - close.shift()).abs(),
+                    (low - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def mfi(high, low, close, volume, period=14):
+    tp = (high + low + close) / 3
+    mf = tp * volume
+    pos = mf.where(tp > tp.shift(), 0.0).rolling(period).sum()
+    neg = mf.where(tp < tp.shift(), 0.0).rolling(period).sum()
+    mr = pos / neg.replace(0, np.nan)
+    return 100 - 100 / (1 + mr)
+
+def obv(close, volume):
+    return (np.sign(close.diff()).fillna(0) * volume).cumsum()
+
+def hurst_exponent(ts, max_lag=20):
+    ts = np.asarray(ts, dtype=float)
+    ts = ts[~np.isnan(ts)]
+    if len(ts) < max_lag + 2:
+        return 0.5
+    lags = range(2, max_lag)
+    tau = []
+    for lag in lags:
+        diff = ts[lag:] - ts[:-lag]
+        sd = np.std(diff)
+        tau.append(sd if sd > 0 else 1e-9)
+    try:
+        poly = np.polyfit(np.log(list(lags)), np.log(tau), 1)
+        return float(poly[0])
+    except Exception:
+        return 0.5
+
+def kalman_signal(close, window=40):
+    """초간단 1D 칼만 필터로 추세 방향 추정 (bullish/neutral/bearish)."""
+    z = close.values[-window:]
+    if len(z) < 5:
+        return "neutral"
+    x, p, q, r = z[0], 1.0, 1e-4, 1.0
+    est = []
+    for m in z:
+        p += q
+        k = p / (p + r)
+        x = x + k * (m - x)
+        p = (1 - k) * p
+        est.append(x)
+    slope = (est[-1] - est[max(0, len(est) - 6)]) / (abs(est[-1]) + 1e-9)
+    if slope > 0.01:
+        return "bullish"
+    if slope < -0.01:
+        return "bearish"
+    return "neutral"
+
+def max_drawdown(close, window=252):
+    c = close.tail(window)
+    roll_max = c.cummax()
+    dd = c / roll_max - 1
+    return float(dd.min() * 100)
+
+
+def compute_indicators(df: pd.DataFrame) -> dict:
+    """OHLCV DataFrame(컬럼: Open/High/Low/Close/Volume) → 지표 dict + 차트용 df."""
+    df = df.copy()
+    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+    df["EMA20"], df["EMA50"], df["EMA200"] = ema(c, 20), ema(c, 50), ema(c, 200)
+    df["RSI"] = rsi(c)
+    df["OBV"] = obv(c, v)
+    last, prev = c.iloc[-1], c.iloc[-2] if len(c) > 1 else c.iloc[-1]
+
+    win = min(252, len(c))
+    high52, low52 = float(c.tail(win).max()), float(c.tail(win).min())
+    z20 = (c - c.rolling(20).mean()) / c.rolling(20).std()
+    z60 = (c - c.rolling(60).mean()) / c.rolling(60).std()
+    vwap = (c * v).rolling(20).sum() / v.rolling(20).sum()
+    obv_s = df["OBV"]
+    up_days = (c.diff() > 0)
+    up_vol = (v[up_days].tail(20).sum()) / (v.tail(20).sum() + 1e-9) * 100
+    close_strength = ((c - l) / (h - l).replace(0, np.nan)).tail(20).mean() * 100
+    ret12 = (last / c.iloc[-win] - 1) * 100 if len(c) >= win else 0.0
+
+    ind = dict(
+        price=float(last),
+        changePct=float((last / prev - 1) * 100),
+        high52w=high52, low52w=low52,
+        rsi=safe(df["RSI"].iloc[-1], 50),
+        adx=safe(adx(h, l, c).iloc[-1], 20),
+        mfi=safe(mfi(h, l, c, v).iloc[-1], 50),
+        atr=safe(atr(h, l, c).iloc[-1], last * 0.03),
+        hurst=r1(hurst_exponent(c.values)),
+        zScoreMeanRev=r1(safe(z20.iloc[-1], 0)),
+        zScoreStat=r1(safe(z60.iloc[-1], 0)),
+        mddPct=r1(max_drawdown(c)),
+        return12m=r1(ret12),
+        volumeRatioVsAvg=r1(safe(v.iloc[-1] / v.tail(20).mean(), 1)),
+        obvTrend="up" if obv_s.iloc[-1] > obv_s.iloc[-min(20, len(obv_s))] else "down",
+        vwapPosition="above" if last >= safe(vwap.iloc[-1], last) else "below",
+        kalmanSignal=kalman_signal(c),
+        upVolPct=r1(safe(up_vol, 50)),
+        closeStrength=r1(safe(close_strength, 50)),
+        gapDir=1 if df["Open"].iloc[-1] > prev else (-1 if df["Open"].iloc[-1] < prev else 0),
+        alignedTimeframes=int((last > df["EMA20"].iloc[-1]) + (df["EMA20"].iloc[-1] > df["EMA50"].iloc[-1]) + (df["EMA50"].iloc[-1] > df["EMA200"].iloc[-1])),
+        pivotBreak=bool(last >= high52 * 0.93),
+        breakoutSignal=bool(last >= high52 * 0.98 and safe(v.iloc[-1] / v.tail(20).mean(), 1) > 1.4),
+    )
+    return {"ind": ind, "df": df}
+
+
+# ----------------------------------------------------------------------------
+# 데이터 수집 (한국/해외 자동 대응)
+# ----------------------------------------------------------------------------
+def _norm_krx(t):
+    return t.replace(".KS", "").replace(".KQ", "").strip()
+
+def fetch_ohlcv(ticker: str, period_days: int = 400):
+    """FinanceDataReader → yfinance 순으로 OHLCV 수집."""
+    warnings = []
+    start = (pd.Timestamp.today() - pd.Timedelta(days=int(period_days * 1.6))).strftime("%Y-%m-%d")
+    # 1) FinanceDataReader
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.DataReader(_norm_krx(ticker), start)
+        if df is not None and len(df) > 30:
+            df = df.rename(columns=str.title)
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), warnings
+    except Exception as e:
+        warnings.append(f"FinanceDataReader 실패: {e}")
+    # 2) yfinance
+    try:
+        import yfinance as yf
+        yt = ticker if "." in ticker or not ticker.isdigit() else ticker + ".KS"
+        df = yf.download(yt, start=start, progress=False, auto_adjust=False)
+        if df is not None and len(df) > 30:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), warnings
+    except Exception as e:
+        warnings.append(f"yfinance 실패: {e}")
+    return None, warnings + ["가격 데이터를 가져오지 못했습니다. 인터넷 연결을 확인하세요."]
+
+def fetch_fundamentals(ticker: str):
+    """pykrx 로 PER/PBR/EPS/BPS → ROE 근사. 실패 시 빈 dict."""
+    out, warnings = {}, []
+    try:
+        from pykrx import stock
+        code = _norm_krx(ticker)
+        today = pd.Timestamp.today().strftime("%Y%m%d")
+        ago = (pd.Timestamp.today() - pd.Timedelta(days=10)).strftime("%Y%m%d")
+        fnd = stock.get_market_fundamental_by_date(ago, today, code)
+        if fnd is not None and len(fnd):
+            row = fnd.iloc[-1]
+            eps, bps = safe(row.get("EPS")), safe(row.get("BPS"))
+            if bps > 0:
+                out["roeAnnual"] = r1(eps / bps * 100)   # ROE ≈ EPS/BPS
+        try:
+            nm = stock.get_market_ticker_name(code)
+            if nm:
+                out["name"] = nm
+        except Exception:
+            pass
+    except Exception as e:
+        warnings.append(f"pykrx 펀더멘털 생략: {e}")
+    return out, warnings
+
+def market_regime():
+    """KOSPI(KS11) 의 EMA200 대비 위치로 시장 국면 판정."""
+    try:
+        import FinanceDataReader as fdr
+        idx = fdr.DataReader("KS11", (pd.Timestamp.today() - pd.Timedelta(days=400)).strftime("%Y-%m-%d"))
+        c = idx["Close"]
+        e200 = ema(c, 200).iloc[-1]
+        a = safe(adx(idx["High"], idx["Low"], c).iloc[-1], 20)
+        if c.iloc[-1] > e200 and a >= 25:
+            return "STRONG_BULL"
+        if c.iloc[-1] > e200:
+            return "BULL"
+        return "BEAR" if c.iloc[-1] < e200 * 0.97 else "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
+
+def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 400):
+    """ticker → 엔진 입력 dict + 차트 df + 경고 목록."""
+    data = dict(DEFAULTS)
+    data["ticker"] = ticker
+    warnings, chart_df = [], None
+
+    df, w1 = fetch_ohlcv(ticker, period_days)
+    warnings += w1
+    if df is not None:
+        res = compute_indicators(df)
+        data.update(res["ind"])
+        chart_df = res["df"]
+        data["marketRegime"] = market_regime()
+    fnd, w2 = fetch_fundamentals(ticker)
+    data.update(fnd)
+    warnings += w2
+
+    # 자동 수집이 어려운 항목 → 합리적 추정 기본값
+    if df is not None:
+        data.setdefault("dcfFairValue", data["price"] * 1.2)
+        data.setdefault("targetPrice", data["price"] * 1.1)
+        # RS 등급 근사 (KOSPI 대비 12M 초과수익)
+        data["rsRating"] = int(clamp(round(60 + data.get("return12m", 0) * 0.05), 1, 99))
+
+    if overrides:
+        data.update({k: v for k, v in overrides.items() if v is not None})
+    return data, chart_df, warnings
+
+
+# ----------------------------------------------------------------------------
+# 지표 점수 정의 (웹 버전과 동일한 공식)
+# ----------------------------------------------------------------------------
+def _distHigh(d): return (1 - d["price"] / d["high52w"]) * 100
+def _distLow(d):  return (d["price"] / d["low52w"] - 1) * 100
+def _dcfUp(d):    return (d["dcfFairValue"] / d["price"] - 1) * 100
+def _tgtUp(d):    return (d["targetPrice"] / d["price"] - 1) * 100
+
+_REGIME = {"STRONG_BULL": 80, "BULL": 62, "NEUTRAL": 45, "BEAR": 20}
+_OBV = {"up": 9, "flat": 0, "down": -25}
+_KAL = {"bullish": 75, "neutral": 37.5, "bearish": 15}
+
+METRICS = [
+    dict(tag="C", title="EPS 가속도", sub="분기 순이익 성장 가속 여부",
+         score=lambda d: clamp(45 + d["epsGrowthQoQ"]/25 + (15 if d["epsAccelQuarters"] >= 2 else 0)),
+         comment=lambda d: f"지난 분기 순이익이 {'+' if d['epsGrowthQoQ']>=0 else ''}{r1(d['epsGrowthQoQ'])}% 변동했어요. " +
+                           ("연속 성장 중이에요." if d["epsAccelQuarters"] >= 2 else "가속 신호는 약해요.")),
+    dict(tag="A", title="연간 ROE 실적", sub="자기자본이익률 기준 충족 여부",
+         score=lambda d: clamp(12 + math.log2(max(d["roeAnnual"]/d["roeThreshold"], 1e-6))*4) if d["roeAnnual"] >= d["roeThreshold"]
+                         else clamp(d["roeAnnual"]/d["roeThreshold"]*35, 0, 40),
+         comment=lambda d: f"자기자본이익률(ROE) {r1(d['roeAnnual'])}%이고, 기준({r1(d['roeThreshold'])}%)을 " +
+                           ("통과했어요. 돈을 잘 버는 회사예요." if d["roeAnnual"] >= d["roeThreshold"] else "미달이에요.")),
+    dict(tag="N", title="신고가·피벗 돌파", sub="52주 최고가 및 패턴 돌파",
+         score=lambda d: clamp(50 - _distHigh(d)*4 + (5 if d["pivotBreak"] else 0)),
+         comment=lambda d: f"52주 최고가에서 {r1(_distHigh(d))}% 아래에 있어요. " +
+                           ("아직 신고가까지 거리가 있어요. " if _distHigh(d) > 3 else "신고가 부근이에요. ") +
+                           ("컵앤핸들 피벗 돌파가 감지됐어요." if d["pivotBreak"] else "")),
+    dict(tag="S", title="거래량 확인 돌파", sub="기관 참여를 동반한 거래량 급증",
+         score=lambda d: clamp(20 + (d["volumeRatioVsAvg"]-1)*60) if d["breakoutSignal"]
+                         else r1(-(d["volumeRatioVsAvg"]-0.3)*15),
+         comment=lambda d: f"거래량이 평소의 {r1(d['volumeRatioVsAvg'])}배예요. " +
+                           ("돌파를 거래량이 확인했어요." if d["breakoutSignal"] else "돌파 신호는 없어요.")),
+    dict(tag="L", title="주도주 판별", sub="시장 대비 상대강도 측정",
+         score=lambda d: clamp(d["rsRating"] - 79),
+         comment=lambda d: f"시장 대비 상대강도(RS) {int(d['rsRating'])}점이에요. " +
+                           ("시장을 이끄는 주도주예요." if d["rsRating"] >= 80 else "주도력이 약해요.")),
+    dict(tag="I", title="기관 수급", sub="기관 자금의 매수-매도 흐름",
+         score=lambda d: clamp(d["mfi"]*0.84),
+         comment=lambda d: f"기관 자금 흐름: '{'매수 우위' if d['mfi']>=80 else '관망' if d['mfi']>=60 else '매도 우위'}'이에요. " +
+                           (f"매수 압력이 강해요 (MFI {int(d['mfi'])})." if d["mfi"] >= 60 else "")),
+    dict(tag="M", title="시장 방향", sub="전체 시장 추세와 방향성",
+         score=lambda d: clamp(_REGIME.get(d["marketRegime"], 45) + clamp(d["adx"]-25, 0, 25)*0.64),
+         comment=lambda d: f"현재 시장 방향: '[M] {d['marketRegime']} ✅'이에요. 추세 강도 ADX {int(d['adx'])}."),
+    dict(tag="Quant", title="가치·퀄리티 팩터", sub="저평가+고품질 종목 선별",
+         score=lambda d: clamp(73 + d["factorAlpha"]),
+         comment=lambda d: f"가치·퀄리티 팩터 알파 {'+' if d['factorAlpha']>=0 else ''}{r1(d['factorAlpha'])}점이에요. " +
+                           ("저평가 매력이 있어요." if d["factorAlpha"] > 0 else "프리미엄 구간이에요.")),
+    dict(tag="Quant", title="평균 회귀", sub="RSI·Z-Score 기반 반등/조정 가능성",
+         score=lambda d: clamp(60 - d["zScoreMeanRev"]*17.33),
+         comment=lambda d: f"RSI {int(d['rsi'])}로 {'과매수' if d['rsi']>=70 else '과매도' if d['rsi']<=30 else '중립'} 구간이에요. " +
+                           ("단기 조정 가능성이 있어요. " if d["zScoreMeanRev"] >= 1.5 else "") + f"Z-Score +{r1(d['zScoreMeanRev'])}."),
+    dict(tag="Quant", title="모멘텀", sub="12개월 수익률 기반 추세 지속력",
+         score=lambda d: clamp(40 + d["return12m"]/20),
+         comment=lambda d: f"1년간 수익률 +{r1(d['return12m'])}%로 모멘텀이 {'강해요' if d['return12m']>100 else '보통이에요'}."),
+    dict(tag="Quant", title="다중 시간대", sub="단기·중기·장기 추세 종합",
+         score=lambda d: clamp(45 + d["alignedTimeframes"]*10),
+         comment=lambda d: f"단기·중기·장기 추세 종합: {'상승' if d['alignedTimeframes']>=2 else '혼조'} 추세예요."),
+    dict(tag="Quant", title="낙폭 위험도", sub="최근 최대 하락폭(MDD) 평가",
+         score=lambda d: clamp(100 - abs(d["mddPct"])*7.3),
+         comment=lambda d: f"최근 최대 낙폭(MDD) {r1(d['mddPct'])}%이에요. 위험도는 '{'낮음' if abs(d['mddPct'])<7 else '보통' if abs(d['mddPct'])<15 else '높음'}'으로 평가돼요."),
+    dict(tag="Quant", title="스마트머니 흐름", sub="기관 자금 흐름과 OBV 추세",
+         score=lambda d: clamp(50 + _OBV.get(d["obvTrend"], 0)),
+         comment=lambda d: "스마트머니 흐름 — OBV 추세: " + {"up": "상승", "flat": "횡보", "down": "하락"}.get(d["obvTrend"], "횡보") + "이에요."),
+    dict(tag="Quant", title="DCF 적정가", sub="DCF 적정가 대비 상승 여력",
+         score=lambda d: clamp(50 + _dcfUp(d)*0.44),
+         comment=lambda d: f"DCF 적정가 대비 상승 여력 +{r1(_dcfUp(d))}%이에요. 전망은 '{'강력 매수' if _dcfUp(d)>30 else '매수' if _dcfUp(d)>0 else '관망'}'예요."),
+    dict(tag="Quant", title="공매도 비율", sub="공매도 부담 수준 평가",
+         score=lambda d: clamp(50 - d["shortRatioPct"]*5),
+         comment=lambda d: f"공매도 비율 {r1(d['shortRatioPct'])}%로 위험도는 '{'NORMAL' if d['shortRatioPct']<5 else 'HIGH'}'이에요."),
+    dict(tag="Math", title="허스트 지수", sub="추세 지속성과 방향 예측력",
+         score=lambda d: clamp(50 + (d["hurst"]-0.5)*144),
+         comment=lambda d: f"허스트 지수 {r1(d['hurst'])}로 '{'강한 추세' if d['hurst']>0.55 else '평균회귀' if d['hurst']<0.45 else '랜덤워크'}'를 나타내요."),
+    dict(tag="Math", title="칼만 필터", sub="노이즈 제거 후 추세 신호",
+         score=lambda d: _KAL.get(d["kalmanSignal"], 37.5),
+         comment=lambda d: "칼만 필터 신호: " + {"bullish": "상승", "neutral": "중립", "bearish": "하락"}.get(d["kalmanSignal"], "중립") + "이에요."),
+    dict(tag="Math", title="통계적 Z-Score", sub="통계적 과매수/과매도 위치",
+         score=lambda d: clamp(50 - (abs(d["zScoreStat"])-1.2)*20),
+         comment=lambda d: f"통계적 Z-Score +{r1(d['zScoreStat'])}이에요. {'정상 범위예요.' if abs(d['zScoreStat'])<1.5 else '극단 구간이에요.'}"),
+    dict(tag="Adj", title="변동성 조정", sub="변동성 대비 수익률 효율성", canNeg=True,
+         score=lambda d: r1(-(d["volMultiplier"]-1)*22.8),
+         comment=lambda d: f"변동성 대비 수익률 효율을 반영해 최종 점수에 ×{r1(d['volMultiplier'])} 배율이 적용됐어요."),
+    dict(tag="Sentiment", title="시장 심리 추정", sub="가격·거래량 기반 투자 심리",
+         score=lambda d: clamp(55 + (d["upVolPct"]-50) + (d["closeStrength"]-50)*0.6 + d["gapDir"]*8),
+         comment=lambda d: f"가격·거래량으로 추정한 심리는 '{'약한 상승' if d['upVolPct']>=60 else '중립'}'이에요. 상승 거래량 {int(d['upVolPct'])}%, 종가 강도 {int(d['closeStrength'])}%."),
+]
+
+
+# ----------------------------------------------------------------------------
+# 종합 계산
+# ----------------------------------------------------------------------------
+def compute_all(d: dict) -> dict:
+    m = [dict(tag=x["tag"], title=x["title"], sub=x["sub"],
+              canNeg=x.get("canNeg", False),
+              value=r1(x["score"](d)), text=x["comment"](d)) for x in METRICS]
+    get = lambda t: next(x["value"] for x in m if x["title"] == t)
+
+    trend = ((d["adx"] >= 25) + (d["hurst"] >= 0.55) + (d["alignedTimeframes"] >= 3)
+             + ("BULL" in d["marketRegime"]) + (_distHigh(d) < 15))
+    momentum = ((2 if d["return12m"] > 100 else 1 if d["return12m"] > 0 else 0)
+                + (2 if d["rsRating"] >= 90 else 1 if d["rsRating"] >= 70 else 0)
+                - (2 if d["rsi"] >= 70 else 0))
+    supply = ((d["obvTrend"] == "up") + (d["vwapPosition"] == "above")
+              + (d["mfi"] >= 60) + (d["mfi"] >= 70))
+    volat = 4 if abs(d["mddPct"]) < 7 else 3 if abs(d["mddPct"]) < 12 else 2
+
+    cats = dict(
+        추세=dict(v=int(clamp(trend, 0, 5)), sub="강한 상승 추세" if d["adx"] >= 40 else "추세 형성 중"),
+        모멘텀=dict(v=int(clamp(momentum, 0, 5)), sub="RSI 과매수 — 차익 경계" if d["rsi"] >= 70 else "양호"),
+        변동성=dict(v=int(clamp(volat, 0, 5)), sub="관망 (BB폭 상위 분위)"),
+        수급=dict(v=int(clamp(supply, 0, 5)), sub="기관 우위 (VWAP 위 + OBV↑)" if d["vwapPosition"] == "above" else "관망"),
+    )
+
+    regimeAvg = (get("시장 방향") + get("허스트 지수") + get("다중 시간대")) / 3
+    valueAvg = (get("가치·퀄리티 팩터") + get("DCF 적정가")) / 2
+    momNet = (get("모멘텀") + get("평균 회귀")) / 2
+    supplyAvg = (get("기관 수급") + get("스마트머니 흐름")) / 2
+    fundAvg = (get("EPS 가속도") + get("연간 ROE 실적")) / 2
+    riskAvg = (get("낙폭 위험도") + get("공매도 비율")) / 2
+    composite = round(0.24*regimeAvg + 0.18*valueAvg + 0.14*momNet
+                      + 0.14*supplyAvg + 0.14*fundAvg + 0.16*riskAvg)
+
+    entryTiming = round(clamp(60 + supply*4 - (28 if d["rsi"] >= 70 else 0)
+                              - (8 if d["zScoreMeanRev"] >= 2 else 0), 0, 100))
+
+    a = d["atr"]
+    buy = round(d["price"] - 1.95*a)
+    stop = round(buy - 0.25*a)
+    t1 = round(d["targetPrice"] + 7.65*a)
+    t2 = round(d["dcfFairValue"] + 7.78*a)
+    rr = r1((t1 - buy) / (buy - stop)) if (buy - stop) > 0 else 0.0
+
+    verdict = ("강력 매수" if composite >= 80 else "매집" if composite >= 60
+               else "관망" if composite >= 40 else "회피")
+    return dict(metrics=m, cats=cats, composite=composite, entryTiming=entryTiming,
+                buy=buy, stop=stop, t1=t1, t2=t2, rr=rr, verdict=verdict,
+                distHigh=r1(_distHigh(d)), distLow=r1(_distLow(d)),
+                dcfUpside=r1(_dcfUp(d)), targetUpside=r1(_tgtUp(d)))
+
+
+# ----------------------------------------------------------------------------
+# 콘솔 단독 실행
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    tk = sys.argv[1] if len(sys.argv) > 1 else "000660"
+    d, df, warns = build_inputs(tk)
+    res = compute_all(d)
+    print(f"\n=== {d.get('name', tk)} ({tk}) ===")
+    print(f"현재가 {d['price']:,.0f}  /  종합 점수 {res['composite']}점  →  {res['verdict']}")
+    print(f"추세 {res['cats']['추세']['v']}/5  모멘텀 {res['cats']['모멘텀']['v']}/5  "
+          f"변동성 {res['cats']['변동성']['v']}/5  수급 {res['cats']['수급']['v']}/5")
+    print(f"진입타이밍 {res['entryTiming']}/100  |  매수 {res['buy']:,}  손절 {res['stop']:,}  "
+          f"1차익절 {res['t1']:,}  2차익절 {res['t2']:,}  (R:R {res['rr']}:1)\n")
+    for x in res["metrics"]:
+        print(f"  [{x['tag']:>9}] {x['title']:<14} {x['value']:>6}  {x['text']}")
+    if warns:
+        print("\n경고:", *warns, sep="\n  - ")
