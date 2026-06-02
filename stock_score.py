@@ -692,6 +692,47 @@ def compute_all(d: dict) -> dict:
 
 
 # ----------------------------------------------------------------------------
+# 동일업종(관련주) 코드 자동 수집
+# ----------------------------------------------------------------------------
+def fetch_peers(ticker: str, limit: int = 5):
+    """네이버 금융 '동일업종비교'에서 같은 업종 종목코드 수집 (best-effort)."""
+    code = _norm_krx(ticker)
+    if not (code.isdigit() and len(code) == 6):
+        return [], ["국내 6자리 종목코드만 동일업종 자동 탐색이 됩니다."]
+    try:
+        import requests, re
+        from bs4 import BeautifulSoup
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get(f"https://finance.naver.com/item/main.naver?code={code}",
+                         headers=headers, timeout=8)
+        r.encoding = r.apparent_encoding or "euc-kr"
+        soup = BeautifulSoup(r.text, "lxml")
+
+        codes = []
+        head = soup.find(string=re.compile("동일업종"))   # '동일업종비교' 영역
+        if head is not None:
+            node = head.find_parent()
+            table = node.find_next("table") if node else None
+            if table is not None:
+                for a in table.find_all("a", href=True):
+                    m = re.search(r"code=(\d{6})", a["href"])
+                    if m:
+                        codes.append(m.group(1))
+        # 자기 자신 제거 + 중복 제거(순서 유지)
+        seen, peers = set(), []
+        for c in codes:
+            if c != code and c not in seen:
+                seen.add(c)
+                peers.append(c)
+        peers = peers[:limit]
+        if not peers:
+            return [], ["동일업종 자동 탐색 실패(페이지 구조 변경 가능). 직접 입력하세요."]
+        return peers, []
+    except Exception as e:
+        return [], [f"동일업종 탐색 실패: {e}"]
+
+
+# ----------------------------------------------------------------------------
 # 관련주 비교용 요약 평가
 # ----------------------------------------------------------------------------
 def evaluate(ticker: str, period_days: int = 400) -> dict:

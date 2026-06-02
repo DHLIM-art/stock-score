@@ -61,6 +61,8 @@ if "base" not in st.session_state:
     st.session_state.fetched = False
     st.session_state.tk_input = S.DEFAULTS["ticker"]
     st.session_state.period = 400
+    st.session_state.cmp_codes = ""
+    st.session_state.peer_warn = []
     for k in EDITABLE:
         st.session_state[k] = S.DEFAULTS[k]
 
@@ -154,14 +156,34 @@ res = S.compute_all(d)
 df = st.session_state.df if st.session_state.df is not None else sample_series(d["price"])
 
 # ---------------------------------------------------------------- 보기 모드 전환
-mode = st.radio("보기 모드", ["📊 단일 종목 분석", "⚖️ 관련주 비교"],
+st.markdown(f"<div style='font-size:13px;font-weight:700;color:{SLATE};margin-bottom:2px'>🔀 보기 모드를 선택하세요</div>", unsafe_allow_html=True)
+mode = st.radio("보기 모드", ["📊 단일 종목 분석", "⚖️ 동종업계 비교"],
                 horizontal=True, label_visibility="collapsed")
 
-# ================================================================ 관련주 비교 (독립 화면)
-if mode == "⚖️ 관련주 비교":
-    st.markdown("## ⚖️ 관련주 비교")
-    st.caption("비교할 종목 코드를 콤마로 입력하세요 (최대 8개). 예: 000660, 005930, 042700")
-    codes_in = st.text_input("종목 코드들", value=st.session_state.get("tk_input", ""), key="cmp_codes")
+# ================================================================ 동종업계 비교 (독립 화면)
+if mode == "⚖️ 동종업계 비교":
+    st.markdown("## ⚖️ 동종업계 비교")
+    st.caption("기준 종목의 동일업종을 자동으로 불러오거나, 코드를 직접 콤마로 입력하세요 (최대 8개).")
+
+    def autofill_peers():
+        base = (st.session_state.get("cmp_codes", "") or st.session_state.get("tk_input", "")).split(",")[0].strip()
+        peers, w = S.fetch_peers(base)
+        st.session_state.peer_warn = w
+        if peers:
+            st.session_state.cmp_codes = base + ", " + ", ".join(peers)
+
+    if not st.session_state.get("cmp_codes"):
+        st.session_state.cmp_codes = st.session_state.get("tk_input", "")
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        codes_in = st.text_input("종목 코드들", key="cmp_codes")
+    with c2:
+        st.write("")
+        st.button("🔍 동일업종 자동 채우기", on_click=autofill_peers, use_container_width=True)
+    if st.session_state.get("peer_warn"):
+        st.caption("· " + " ".join(st.session_state.peer_warn))
+
     cperiod = st.slider("데이터 기간(일)", 200, 700, int(st.session_state.get("period", 400)), 50, key="cmp_period")
     if st.button("비교하기", type="primary", key="cmp_run"):
         codes = [c.strip() for c in codes_in.split(",")]
