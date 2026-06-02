@@ -36,15 +36,22 @@ GREEN, ORANGE, RED, BLUE, INK, SLATE = "#16a34a", "#f59e0b", "#ef4444", "#2563eb
 TAGCOL = {"C": ("#2563eb", "#dbeafe"), "A": ("#2563eb", "#dbeafe"), "N": ("#64748b", "#f1f5f9"),
           "S": ("#2563eb", "#dbeafe"), "L": ("#2563eb", "#dbeafe"), "I": ("#2563eb", "#dbeafe"),
           "M": ("#7c3aed", "#ede9fe"), "Quant": ("#0891b2", "#cffafe"), "Math": ("#db2777", "#fce7f3"),
-          "Adj": ("#ea580c", "#ffedd5"), "Sentiment": ("#059669", "#d1fae5")}
+          "Adj": ("#ea580c", "#ffedd5"), "Sentiment": ("#059669", "#d1fae5"),
+          "Value": ("#15803d", "#dcfce7"), "Macro": ("#9333ea", "#f3e8ff")}
 
 def scol(s): return GREEN if s >= 70 else ORANGE if s >= 40 else RED
 def won(x): return f"{x:,.0f}" if x is not None else "—"
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def eval_cached(ticker, period):
+    """관련주 비교용: 종목별 평가를 1시간 캐시."""
+    return S.evaluate(ticker, period)
+
 EDITABLE = ["price", "roeAnnual", "roeThreshold", "epsGrowthQoQ", "epsAccelQuarters",
             "rsRating", "return12m", "mddPct", "rsi", "adx", "mfi", "hurst",
             "zScoreMeanRev", "shortRatioPct", "dcfFairValue", "targetPrice",
-            "atr", "factorAlpha", "volMultiplier"]
+            "atr", "factorAlpha", "volMultiplier",
+            "per", "pbr", "dividendYield", "debtRatio", "vix"]
 
 # ---------------------------------------------------------------- 상태 초기화
 if "base" not in st.session_state:
@@ -129,6 +136,14 @@ with st.sidebar:
         st.number_input("DCF 적정가", key="dcfFairValue", step=1000.0)
         st.number_input("증권사 목표가", key="targetPrice", step=1000.0)
         st.number_input("변동성 배율", key="volMultiplier", step=0.01, format="%.2f")
+    with st.expander("가치투자 지표"):
+        st.number_input("PER (배)", key="per", step=0.1)
+        st.number_input("PBR (배)", key="pbr", step=0.1)
+        st.number_input("배당수익률 %", key="dividendYield", step=0.1)
+        st.number_input("부채비율 %", key="debtRatio", step=1.0)
+    with st.expander("매크로 (시장 환경)"):
+        st.number_input("VIX (공포지수)", key="vix", step=0.5)
+        st.caption("KOSPI 국면·환율·금리는 자동 수집/기본값을 사용합니다.")
     if st.session_state.warns:
         st.warning("· " + "\n· ".join(st.session_state.warns[:3]))
 
@@ -138,6 +153,66 @@ d.update({k: st.session_state[k] for k in EDITABLE})
 res = S.compute_all(d)
 df = st.session_state.df if st.session_state.df is not None else sample_series(d["price"])
 
+# ---------------------------------------------------------------- 보기 모드 전환
+mode = st.radio("보기 모드", ["📊 단일 종목 분석", "⚖️ 관련주 비교"],
+                horizontal=True, label_visibility="collapsed")
+
+# ================================================================ 관련주 비교 (독립 화면)
+if mode == "⚖️ 관련주 비교":
+    st.markdown("## ⚖️ 관련주 비교")
+    st.caption("비교할 종목 코드를 콤마로 입력하세요 (최대 8개). 예: 000660, 005930, 042700")
+    codes_in = st.text_input("종목 코드들", value=st.session_state.get("tk_input", ""), key="cmp_codes")
+    cperiod = st.slider("데이터 기간(일)", 200, 700, int(st.session_state.get("period", 400)), 50, key="cmp_period")
+    if st.button("비교하기", type="primary", key="cmp_run"):
+        codes = [c.strip() for c in codes_in.split(",")]
+        codes = [c for c in dict.fromkeys(codes) if c][:8]
+        rows = []
+        with st.spinner("관련주 평가 중... (종목당 수 초 걸립니다)"):
+            for c in codes:
+                try:
+                    rows.append(eval_cached(c, int(cperiod)))
+                except Exception:
+                    pass
+        st.session_state.cmp_rows = rows
+
+    rows = st.session_state.get("cmp_rows", [])
+    if not rows:
+        st.info("종목 코드를 입력하고 '비교하기'를 누르세요.")
+    else:
+        cmp = pd.DataFrame(rows)
+        cmp["종목"] = cmp["name"].astype(str) + " (" + cmp["ticker"].astype(str) + ")"
+        table = (cmp.set_index("종목")[["composite", "CAN SLIM", "가치", "모멘텀",
+                 "퀄리티", "매크로", "PER", "PBR", "ROE", "배당%", "12M%"]]
+                 .rename(columns={"composite": "종합"}))
+        st.dataframe(table, use_container_width=True)
+
+        order = cmp.sort_values("composite")
+        bar = go.Figure(go.Bar(
+            x=order["composite"], y=order["종목"], orientation="h",
+            text=order["composite"], textposition="outside",
+            marker_color=[GREEN if v >= 60 else ORANGE if v >= 40 else RED for v in order["composite"]]))
+        bar.update_layout(title="종합 점수", height=80 + 42 * len(order),
+                          margin=dict(l=10, r=30, t=40, b=10), plot_bgcolor="white",
+                          paper_bgcolor="white", font=dict(size=11, color=SLATE))
+        bar.update_xaxes(range=[0, 100], gridcolor="#f1f5f9")
+        st.plotly_chart(bar, use_container_width=True, config={"displayModeBar": False})
+
+        styles = ["CAN SLIM", "가치", "모멘텀", "퀄리티", "매크로"]
+        scolors = ["#2563eb", "#15803d", "#0891b2", "#7c3aed", "#9333ea"]
+        gb = go.Figure()
+        for sname, sc in zip(styles, scolors):
+            gb.add_trace(go.Bar(name=sname, x=cmp["종목"], y=cmp[sname], marker_color=sc))
+        gb.update_layout(title="스타일별 점수 비교", barmode="group", height=360,
+                         margin=dict(l=10, r=10, t=40, b=10), plot_bgcolor="white",
+                         paper_bgcolor="white", legend=dict(orientation="h", y=1.12),
+                         font=dict(size=11, color=SLATE))
+        gb.update_yaxes(range=[0, 100], gridcolor="#f1f5f9")
+        st.plotly_chart(gb, use_container_width=True, config={"displayModeBar": False})
+        st.caption("※ 매크로 점수는 시장 공통이라 종목 간 차이가 거의 없어요. "
+                   "자동 수집이 안 된 재무값은 추정/중립값일 수 있습니다.")
+    st.stop()   # 비교 모드에서는 아래 단일 종목 대시보드를 렌더링하지 않음
+
+# ================================================================ 단일 종목 분석
 # ---------------------------------------------------------------- 헤더
 st.markdown(f"## {d.get('name','종목')}  "
             f"<span style='font-size:14px;color:{SLATE}'>{d.get('ticker','')} · {d.get('sector','')}</span>",
@@ -152,6 +227,18 @@ for col, (name, info) in zip(cols, res["cats"].items()):
         f"<div class='card'><div class='cat-name'>{name}</div>"
         f"<div class='cat-v'>{info['v']}<span style='font-size:14px;color:{SLATE};font-weight:600'>/5</span></div>"
         f"<div class='cat-sub'>{info['sub']}</div></div>", unsafe_allow_html=True)
+
+# 스타일별 점수 (CAN SLIM · 가치 · 모멘텀 · 퀄리티 · 매크로)
+st.write("")
+st.markdown("##### 투자 스타일별 점수")
+scols = st.columns(len(res["styles"]))
+for col, (name, val) in zip(scols, res["styles"].items()):
+    col.markdown(
+        f"<div class='card' style='text-align:center;padding:12px 8px'>"
+        f"<div class='cat-name'>{name}</div>"
+        f"<div style='font-size:24px;font-weight:800;color:{scol(val)}'>{val}</div>"
+        f"<div class='bar'><div style='width:{max(0,min(100,val))}%;height:100%;background:{scol(val)};border-radius:4px'></div></div>"
+        f"</div>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------- 차트
 st.write("")
@@ -243,7 +330,8 @@ def grid(metrics):
                 unsafe_allow_html=True)
 
 with right:
-    t1, t2, t3, t4 = st.tabs(["CAN SLIM 분석", "기술 지표", "재무 지표", "공시·뉴스"])
+    t1, t2, t3, t4, t5, t6 = st.tabs(
+        ["CAN SLIM 분석", "가치투자", "모멘텀·기술", "매크로", "재무 지표", "공시·뉴스"])
     with t1:
         canslim = [
             ("C", f"분기 실적이 {d['epsAccelQuarters']}분기 연속 가속 성장 중이에요", GREEN),
@@ -263,13 +351,20 @@ with right:
         st.markdown(f"<div class='card'><div style='text-align:center;font-weight:800;color:{SLATE};"
                     f"margin-bottom:10px'>═══ CAN SLIM 원칙 요약 ═══</div>{rows}</div>", unsafe_allow_html=True)
         st.write("")
-        grid(res["metrics"])
+        grid([m for m in res["metrics"] if m["tag"] in ("C", "A", "N", "S", "L", "I", "M")])
     with t2:
-        grid([m for m in res["metrics"] if m["tag"] in ("Quant", "Math")])
+        st.caption(f"가치투자 종합: {res['styles']['가치']}점 — 저평가·재무안정·배당·안전마진 관점")
+        grid([m for m in res["metrics"] if m["tag"] == "Value"])
     with t3:
-        grid([m for m in res["metrics"] if m["title"] in
-              ("EPS 가속도", "연간 ROE 실적", "가치·퀄리티 팩터", "DCF 적정가")])
+        grid([m for m in res["metrics"] if m["tag"] in ("Quant", "Math")])
     with t4:
+        st.caption(f"매크로(시장 환경) 종합: {res['styles']['매크로']}점 — 종목 무관 시장 전반")
+        grid([m for m in res["metrics"] if m["tag"] == "Macro"])
+    with t5:
+        grid([m for m in res["metrics"] if m["title"] in
+              ("EPS 가속도", "연간 ROE 실적", "가치·퀄리티 팩터", "DCF 적정가",
+               "PER 밸류", "PBR 밸류", "재무 안정성")])
+    with t6:
         sm = next(m for m in res["metrics"] if m["title"] == "시장 심리 추정")
         st.markdown(f"<div class='card' style='line-height:1.7;font-size:13px;color:{SLATE}'>"
                     f"공시·뉴스 탭은 외부 뉴스 API(네이버 금융, DART)를 연결해야 합니다. "

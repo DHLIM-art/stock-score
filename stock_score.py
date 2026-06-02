@@ -52,6 +52,10 @@ DEFAULTS = dict(
     factorAlpha=12.8, alignedTimeframes=3, obvTrend="up", vwapPosition="above",
     marketRegime="STRONG_BULL", kalmanSignal="neutral",
     upVolPct=60.0, closeStrength=57.0, gapDir=1, volMultiplier=1.18, atr=95000.0,
+    # --- 가치투자 지표 ---
+    per=12.0, pbr=2.1, dividendYield=1.2, debtRatio=35.0, pegRatio=0.4,
+    # --- 매크로 (시장 공통) ---
+    usdkrwTrend="down", rateTrend="flat", vix=16.0,
 )
 
 
@@ -265,6 +269,32 @@ def market_regime():
         return "NEUTRAL"
 
 
+def fetch_macro():
+    """시장 환경(매크로) 지표: USD/KRW 추세, VIX. (종목 공통)"""
+    out, warns = {}, []
+    try:
+        import FinanceDataReader as fdr
+        start = (pd.Timestamp.today() - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+        # 환율: 최근 20일 추세 (원화 약세 = 위험회피)
+        try:
+            fx = fdr.DataReader("USD/KRW", start)["Close"].dropna()
+            if len(fx) > 21:
+                out["usdkrwTrend"] = "up" if fx.iloc[-1] > fx.iloc[-21] * 1.005 else \
+                                     ("down" if fx.iloc[-1] < fx.iloc[-21] * 0.995 else "flat")
+        except Exception:
+            pass
+        # 변동성: VIX
+        try:
+            vix = fdr.DataReader("VIX", start)["Close"].dropna()
+            if len(vix):
+                out["vix"] = r1(float(vix.iloc[-1]))
+        except Exception:
+            pass
+    except Exception as e:
+        warns.append(f"매크로 수집 생략: {e}")
+    return out, warns
+
+
 _LISTING = {}  # KRX 종목명 목록 캐시 (프로세스 1회만 다운로드)
 
 def fetch_name(ticker: str):
@@ -315,8 +345,8 @@ def _to_num(x):
         return None
 
 def _parse_naver_fin(fin):
-    """네이버 '기업실적분석' 표 → (ROE, EPS성장률%)."""
-    roe = epsg = None
+    """네이버 '기업실적분석' 표 → dict(roe, epsg, per, pbr, div, debt)."""
+    out = {}
     try:
         cols = fin.columns
         fin = fin.copy()
@@ -331,15 +361,32 @@ def _parse_naver_fin(fin):
             vals = [_to_num(v) for v in fin.loc[idx[0]].tolist()[1:]]
             return [v for v in vals if v is not None]
 
-        rv = row_vals("ROE")
-        if rv:
-            roe = rv[-1]
+        def last(key):
+            v = row_vals(key)
+            return v[-1] if v else None
+
+        roe = last("ROE")
+        if roe is not None:
+            out["roeAnnual"] = r1(roe)
         ev = row_vals("EPS")
         if len(ev) >= 2 and ev[-2] not in (0, None):
-            epsg = (ev[-1] - ev[-2]) / abs(ev[-2]) * 100
+            out["epsGrowthQoQ"] = r1((ev[-1] - ev[-2]) / abs(ev[-2]) * 100)
+            out["epsAccelQuarters"] = 2 if out["epsGrowthQoQ"] > 0 else 0
+        per = last("PER")
+        if per is not None and per > 0:
+            out["per"] = r1(per)
+        pbr = last("PBR")
+        if pbr is not None and pbr > 0:
+            out["pbr"] = r1(pbr)
+        div = last("배당")  # 시가배당률(%)
+        if div is not None:
+            out["dividendYield"] = r1(div)
+        debt = last("부채비율")
+        if debt is not None:
+            out["debtRatio"] = r1(debt)
     except Exception:
         pass
-    return roe, epsg
+    return out
 
 def fetch_naver(ticker: str):
     """네이버 금융에서 ROE·EPS성장·증권사 목표주가 수집 (best-effort, 실패 시 빈 dict)."""
@@ -355,17 +402,12 @@ def fetch_naver(ticker: str):
                          headers=headers, timeout=8)
         r.encoding = r.apparent_encoding or "euc-kr"
         html = r.text
-        # 1) ROE / EPS 성장률
+        # 1) ROE / EPS 성장률 / PER / PBR / 배당 / 부채
         try:
             for t in pd.read_html(StringIO(html)):
                 flat = " ".join(sum(t.astype(str).values.tolist(), []))
                 if "ROE" in flat and "EPS" in flat:
-                    roe, epsg = _parse_naver_fin(t)
-                    if roe is not None:
-                        out["roeAnnual"] = r1(roe)
-                    if epsg is not None:
-                        out["epsGrowthQoQ"] = r1(epsg)
-                        out["epsAccelQuarters"] = 2 if epsg > 0 else 0
+                    out.update(_parse_naver_fin(t))
                     break
         except Exception:
             pass
@@ -426,12 +468,27 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
         # RS 등급 근사 (12M 수익률 기반)
         data["rsRating"] = int(clamp(round(60 + data.get("return12m", 0) * 0.05), 1, 99))
 
-        # 네이버 금융에서 ROE·EPS성장·목표주가 보강 (성공 시 위 중립값을 덮어씀)
+        # 네이버 금융에서 ROE·EPS성장·PER·PBR·배당·부채·목표주가 보강
         nv, w3 = fetch_naver(ticker)
         data.update(nv)
         warnings += w3
+
+        # 가치지표: 네이버에서 못 받은 항목은 중립값으로 (예시값이 남지 않도록)
+        if "per" not in nv: data["per"] = 15.0
+        if "pbr" not in nv: data["pbr"] = 1.5
+        if "dividendYield" not in nv: data["dividendYield"] = 0.0
+        if "debtRatio" not in nv: data["debtRatio"] = 80.0
+        # PEG = PER / (EPS성장률) — 성장 대비 밸류
+        g = data.get("epsGrowthQoQ", 0)
+        data["pegRatio"] = r1(data["per"] / g) if g and g > 0 else 3.0
+
+        # 매크로(시장 공통) 수집
+        mac, w4 = fetch_macro()
+        data.update(mac)
+        warnings += w4
+
         if not nv:
-            warnings.append("DCF·목표가·EPS성장·ROE는 추정/중립값입니다. 실제 값은 사이드바에서 보정하세요.")
+            warnings.append("DCF·목표가·PER·PBR·배당·ROE는 추정/중립값입니다. 실제 값은 사이드바에서 보정하세요.")
 
     if overrides:
         data.update({k: v for k, v in overrides.items() if v is not None})
@@ -522,6 +579,40 @@ METRICS = [
     dict(tag="Sentiment", title="시장 심리 추정", sub="가격·거래량 기반 투자 심리",
          score=lambda d: clamp(55 + (d["upVolPct"]-50) + (d["closeStrength"]-50)*0.6 + d["gapDir"]*8),
          comment=lambda d: f"가격·거래량으로 추정한 심리는 '{'약한 상승' if d['upVolPct']>=60 else '중립'}'이에요. 상승 거래량 {int(d['upVolPct'])}%, 종가 강도 {int(d['closeStrength'])}%."),
+
+    # ---------------- 가치투자 (Value) ----------------
+    dict(tag="Value", title="PER 밸류", sub="이익 대비 주가(낮을수록 저평가)",
+         score=lambda d: clamp(100 - (d["per"] - 5) * 4),
+         comment=lambda d: f"PER {r1(d['per'])}배예요. {'저평가 구간' if d['per']<10 else '적정' if d['per']<20 else '고평가 구간'}이에요."),
+    dict(tag="Value", title="PBR 밸류", sub="순자산 대비 주가(낮을수록 저평가)",
+         score=lambda d: clamp(100 - (d["pbr"] - 0.5) * 30),
+         comment=lambda d: f"PBR {r1(d['pbr'])}배예요. {'자산가치 대비 싸요' if d['pbr']<1 else '적정' if d['pbr']<2.5 else '프리미엄 구간'}이에요."),
+    dict(tag="Value", title="배당 매력", sub="시가배당률",
+         score=lambda d: clamp(d["dividendYield"] * 18),
+         comment=lambda d: f"시가배당률 {r1(d['dividendYield'])}%예요. {'배당 매력이 높아요' if d['dividendYield']>=3 else '배당은 보통이에요' if d['dividendYield']>0 else '배당이 거의 없어요'}."),
+    dict(tag="Value", title="재무 안정성", sub="부채비율(낮을수록 안전)",
+         score=lambda d: clamp(110 - d["debtRatio"]),
+         comment=lambda d: f"부채비율 {r1(d['debtRatio'])}%예요. {'재무가 탄탄해요' if d['debtRatio']<50 else '보통이에요' if d['debtRatio']<100 else '부채 부담이 있어요'}."),
+    dict(tag="Value", title="안전마진", sub="DCF 적정가 대비 괴리",
+         score=lambda d: clamp(50 + _dcfUp(d) * 0.5),
+         comment=lambda d: f"적정가 대비 +{r1(_dcfUp(d))}%의 안전마진이에요. {'매력적' if _dcfUp(d)>20 else '보통' if _dcfUp(d)>0 else '여유 없음'}이에요."),
+    dict(tag="Value", title="성장 대비 밸류(PEG)", sub="PER ÷ 이익성장률",
+         score=lambda d: clamp(100 - d["pegRatio"] * 40),
+         comment=lambda d: f"PEG {r1(d['pegRatio'])}예요. {'성장 대비 저평가' if d['pegRatio']<1 else '적정' if d['pegRatio']<2 else '성장 대비 비쌈'}이에요."),
+
+    # ---------------- 매크로 (시장 환경) ----------------
+    dict(tag="Macro", title="시장 추세", sub="KOSPI 국면",
+         score=lambda d: {"STRONG_BULL": 90, "BULL": 70, "NEUTRAL": 45, "BEAR": 20}.get(d["marketRegime"], 45),
+         comment=lambda d: f"전체 시장은 '{d['marketRegime']}' 국면이에요. {'위험자산에 우호적' if 'BULL' in d['marketRegime'] else '신중 구간'}이에요."),
+    dict(tag="Macro", title="환율(USD/KRW)", sub="원화 방향(약세=위험회피)",
+         score=lambda d: {"down": 75, "flat": 52, "up": 32}.get(d["usdkrwTrend"], 50),
+         comment=lambda d: "원/달러 환율이 " + {"down": "하락(원화 강세) — 외국인 우호적", "flat": "횡보 — 중립", "up": "상승(원화 약세) — 위험회피"}.get(d["usdkrwTrend"], "중립") + "이에요."),
+    dict(tag="Macro", title="금리 방향", sub="완화=우호 / 긴축=부담",
+         score=lambda d: {"down": 75, "flat": 55, "up": 35}.get(d["rateTrend"], 55),
+         comment=lambda d: "금리가 " + {"down": "하락(완화) — 주식에 우호적", "flat": "횡보 — 중립", "up": "상승(긴축) — 밸류에 부담"}.get(d["rateTrend"], "중립") + "이에요."),
+    dict(tag="Macro", title="변동성(VIX)", sub="공포지수(낮을수록 안정)",
+         score=lambda d: clamp(100 - (d["vix"] - 10) * 3),
+         comment=lambda d: f"VIX {r1(d['vix'])}예요. {'시장이 안정적' if d['vix']<20 else '경계 구간' if d['vix']<30 else '공포 구간'}이에요."),
 ]
 
 
@@ -556,8 +647,30 @@ def compute_all(d: dict) -> dict:
     supplyAvg = (get("기관 수급") + get("스마트머니 흐름")) / 2
     fundAvg = (get("EPS 가속도") + get("연간 ROE 실적")) / 2
     riskAvg = (get("낙폭 위험도") + get("공매도 비율")) / 2
-    composite = round(0.24*regimeAvg + 0.18*valueAvg + 0.14*momNet
-                      + 0.14*supplyAvg + 0.14*fundAvg + 0.16*riskAvg)
+    composite_tech = round(0.24*regimeAvg + 0.18*valueAvg + 0.14*momNet
+                           + 0.14*supplyAvg + 0.14*fundAvg + 0.16*riskAvg)
+
+    # ---- 투자 스타일별 점수 ----
+    def avg_titles(titles):
+        vals = [get(t) for t in titles]
+        return round(sum(vals) / len(vals)) if vals else 0
+
+    def avg_tag(tag):
+        vals = [x["value"] for x in m if x["tag"] == tag]
+        return round(sum(vals) / len(vals)) if vals else 0
+
+    styles = {
+        "CAN SLIM": avg_titles(["EPS 가속도", "연간 ROE 실적", "신고가·피벗 돌파",
+                                "거래량 확인 돌파", "주도주 판별", "기관 수급", "시장 방향"]),
+        "가치": avg_tag("Value"),
+        "모멘텀": avg_titles(["모멘텀", "다중 시간대", "주도주 판별", "신고가·피벗 돌파"]),
+        "퀄리티": avg_titles(["연간 ROE 실적", "가치·퀄리티 팩터", "재무 안정성"]),
+        "매크로": avg_tag("Macro"),
+    }
+    # ---- 스타일 통합 종합 점수 (가중치는 자유 튜닝 가능) ----
+    composite = round(0.28*styles["CAN SLIM"] + 0.24*styles["가치"]
+                      + 0.20*styles["모멘텀"] + 0.16*styles["퀄리티"]
+                      + 0.12*styles["매크로"])
 
     entryTiming = round(clamp(60 + supply*4 - (28 if d["rsi"] >= 70 else 0)
                               - (8 if d["zScoreMeanRev"] >= 2 else 0), 0, 100))
@@ -571,10 +684,51 @@ def compute_all(d: dict) -> dict:
 
     verdict = ("강력 매수" if composite >= 80 else "매집" if composite >= 60
                else "관망" if composite >= 40 else "회피")
-    return dict(metrics=m, cats=cats, composite=composite, entryTiming=entryTiming,
+    return dict(metrics=m, cats=cats, composite=composite, composite_tech=composite_tech,
+                styles=styles, entryTiming=entryTiming,
                 buy=buy, stop=stop, t1=t1, t2=t2, rr=rr, verdict=verdict,
                 distHigh=r1(_distHigh(d)), distLow=r1(_distLow(d)),
                 dcfUpside=r1(_dcfUp(d)), targetUpside=r1(_tgtUp(d)))
+
+
+# ----------------------------------------------------------------------------
+# 관련주 비교용 요약 평가
+# ----------------------------------------------------------------------------
+def evaluate(ticker: str, period_days: int = 400) -> dict:
+    """단일 종목을 평가해 비교용 요약 dict 반환."""
+    d, _df, _w = build_inputs(ticker, period_days=period_days)
+    r = compute_all(d)
+    return {
+        "ticker": ticker,
+        "name": d.get("name", ticker),
+        "price": d["price"],
+        "composite": r["composite"],
+        "verdict": r["verdict"],
+        "CAN SLIM": r["styles"]["CAN SLIM"],
+        "가치": r["styles"]["가치"],
+        "모멘텀": r["styles"]["모멘텀"],
+        "퀄리티": r["styles"]["퀄리티"],
+        "매크로": r["styles"]["매크로"],
+        "PER": d.get("per"),
+        "PBR": d.get("pbr"),
+        "ROE": d.get("roeAnnual"),
+        "배당%": d.get("dividendYield"),
+        "12M%": d.get("return12m"),
+        "RSI": r1(d.get("rsi", 0)),
+    }
+
+def compare(tickers, period_days: int = 400):
+    """여러 종목을 평가해 리스트로 반환 (실패 종목은 건너뜀)."""
+    rows = []
+    for t in tickers:
+        t = str(t).strip()
+        if not t:
+            continue
+        try:
+            rows.append(evaluate(t, period_days))
+        except Exception:
+            pass
+    return rows
 
 
 # ----------------------------------------------------------------------------
@@ -586,6 +740,7 @@ if __name__ == "__main__":
     res = compute_all(d)
     print(f"\n=== {d.get('name', tk)} ({tk}) ===")
     print(f"현재가 {d['price']:,.0f}  /  종합 점수 {res['composite']}점  →  {res['verdict']}")
+    print("스타일별: " + "  ".join(f"{k} {v}" for k, v in res["styles"].items()))
     print(f"추세 {res['cats']['추세']['v']}/5  모멘텀 {res['cats']['모멘텀']['v']}/5  "
           f"변동성 {res['cats']['변동성']['v']}/5  수급 {res['cats']['수급']['v']}/5")
     print(f"진입타이밍 {res['entryTiming']}/100  |  매수 {res['buy']:,}  손절 {res['stop']:,}  "
