@@ -54,18 +54,6 @@ EDITABLE = ["price", "roeAnnual", "roeThreshold", "epsGrowthQoQ", "epsAccelQuart
             "per", "pbr", "dividendYield", "debtRatio", "vix"]
 
 # ---------------------------------------------------------------- 상태 초기화
-if "base" not in st.session_state:
-    st.session_state.base = dict(S.DEFAULTS)
-    st.session_state.df = None
-    st.session_state.warns = []
-    st.session_state.fetched = False
-    st.session_state.tk_input = S.DEFAULTS["ticker"]
-    st.session_state.period = 400
-    st.session_state.cmp_codes = ""
-    st.session_state.peer_warn = []
-    for k in EDITABLE:
-        st.session_state[k] = S.DEFAULTS[k]
-
 def do_load():
     """티커 입력칸 Enter 또는 버튼 클릭 시 실행되는 콜백."""
     ticker = (st.session_state.get("tk_input") or "").strip()
@@ -78,6 +66,28 @@ def do_load():
     st.session_state.fetched = True
     for k in EDITABLE:
         st.session_state[k] = base.get(k, S.DEFAULTS[k])
+    # 최근 검색 기록 갱신 (중복 제거, 최신순, 최대 8개) — 세션 동안 유지
+    hist = [ticker] + [h for h in st.session_state.get("history", []) if h != ticker]
+    st.session_state.history = hist[:8]
+
+if "base" not in st.session_state:
+    st.session_state.base = dict(S.DEFAULTS)
+    st.session_state.df = None
+    st.session_state.warns = []
+    st.session_state.fetched = False
+    st.session_state.tk_input = "005930"          # 첫 화면 기본: 삼성전자
+    st.session_state.period = 400
+    st.session_state.cmp_codes = ""
+    st.session_state.peer_warn = []
+    st.session_state.history = []
+    for k in EDITABLE:
+        st.session_state[k] = S.DEFAULTS[k]
+    # 첫 진입 시 삼성전자를 자동으로 불러오기
+    with st.spinner("삼성전자(005930) 데이터를 불러오는 중..."):
+        try:
+            do_load()
+        except Exception:
+            pass
 
 def sample_series(price):
     rng = np.random.default_rng(42)
@@ -104,6 +114,18 @@ with st.sidebar:
     st.markdown("### 종목 평가")
     st.text_input("종목코드 또는 종목명  (입력 후 Enter)", key="tk_input", on_change=do_load,
                   help="6자리 코드(예 005930) · 정확한 종목명(예 삼성전자) · 해외 티커(예 AAPL)")
+
+    # 최근 검색 기록 (세션 동안 유지) — 골라서 바로 다시 조회
+    _HIST_PLACEHOLDER = "— 최근 검색 기록 —"
+    def pick_history():
+        v = st.session_state.get("hist_pick")
+        if v and v != _HIST_PLACEHOLDER:
+            st.session_state.tk_input = v
+            do_load()
+    if st.session_state.get("history"):
+        st.selectbox("📜 최근 검색", [_HIST_PLACEHOLDER] + st.session_state.history,
+                     key="hist_pick", on_change=pick_history)
+
     st.slider("데이터 기간(일)", 200, 700, step=50, key="period")
     st.button("📡 실데이터 불러오기", use_container_width=True, type="primary", on_click=do_load)
 
@@ -390,7 +412,7 @@ with right:
     with t1:
         cs = [
             ("C", "EPS 가속도", f"분기 순이익 {S.r1(d['epsGrowthQoQ'])}% · {d['epsAccelQuarters']}분기 가속"),
-            ("A", "연간 ROE 실적", f"ROE {S.r1(d['roeAnnual'])}% (기준 {S.r1(d['roeThreshold'])}%)"),
+            ("A", "ROE 실적", f"ROE {S.r1(d['roeAnnual'])}% (기준 {S.r1(d['roeThreshold'])}%)"),
             ("N", "신고가·피벗 돌파", f"52주 고점 -{res['distHigh']}% · 피벗 {'돌파' if d['pivotBreak'] else '관찰'}"),
             ("S", "거래량 확인 돌파", f"거래량 평소의 {S.r1(d['volumeRatioVsAvg'])}배"),
             ("L", "주도주 판별", f"상대강도(RS) {int(d['rsRating'])}점"),
@@ -417,7 +439,7 @@ with right:
         st.write("")
         grid([m for m in res["metrics"] if m["tag"] == "Macro"])
     with t5:
-        fin_titles = ("EPS 가속도", "연간 ROE 실적", "가치·퀄리티 팩터", "DCF 적정가",
+        fin_titles = ("EPS 가속도", "ROE 실적", "가치·퀄리티 팩터", "DCF 적정가",
                       "PER 밸류", "PBR 밸류", "재무 안정성")
         fin = [m for m in res["metrics"] if m["title"] in fin_titles]
         st.caption(f"퀄리티 종합: {res['styles']['퀄리티']}점 — 수익성·밸류·재무 건전성")

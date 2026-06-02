@@ -374,7 +374,8 @@ def _to_num(x):
 
 def _parse_naver_fin(fin):
     """네이버 '기업실적분석' 표 → dict(roe, epsGrowthQoQ, per, pbr, dividendYield, debtRatio).
-    EPS 성장은 연간 실적(추정치 'E' 제외)의 YoY로 계산해 안정적으로."""
+    가장 최근 '분기' 실적을 우선 사용(분기 칸이 비면 연간으로 폴백).
+    EPS 성장은 분기 YoY(4분기 전 대비) 우선, 없으면 분기 QoQ, 그것도 없으면 연간 YoY."""
     out = {}
     try:
         cols = [(" ".join(map(str, c)) if isinstance(c, tuple) else str(c)) for c in fin.columns]
@@ -383,57 +384,65 @@ def _parse_naver_fin(fin):
         label_col = cols[0]
         labels = fin[label_col].astype(str)
         data_cols = cols[1:]
-        annual_cols = [c for c in data_cols if "연간" in c] or data_cols  # 연간 칼럼 우선
+        q_cols = [c for c in data_cols if "분기" in c]      # 분기 실적 칼럼
+        a_cols = [c for c in data_cols if "연간" in c]      # 연간 실적 칼럼
+        if not q_cols and not a_cols:                        # MultiIndex 아님 → 전체를 분기 후보로
+            q_cols = data_cols
 
         def row(key):
             idx = labels[labels.str.contains(key, na=False)].index
             return fin.loc[idx[0]] if len(idx) else None
 
-        def last_num(key, columns=None):
+        def actuals(rr, group):
+            return [v for v in (_to_num(rr[c]) for c in group if "(E)" not in c) if v is not None]
+
+        def latest(key, positive=False):
+            """분기 실적 우선 → 연간 실적 → 아무 값 순으로 최신값. positive=True면 0 이하 무시."""
             rr = row(key)
             if rr is None:
                 return None
-            use = columns if columns is not None else annual_cols
-            actual = [_to_num(rr[c]) for c in use if "(E)" not in c]
-            actual = [v for v in actual if v is not None]
-            if actual:
-                return actual[-1]               # 최근 연간 실적 우선
-            anyv = [_to_num(rr[c]) for c in use]
-            anyv = [v for v in anyv if v is not None]
-            return anyv[-1] if anyv else None    # 없으면 추정치라도
+            def vals(group):
+                vs = actuals(rr, group)
+                return [v for v in vs if v > 0] if positive else vs
+            for group in (q_cols, a_cols, data_cols):
+                av = vals(group)
+                if av:
+                    return av[-1]
+            anyv = [v for v in (_to_num(rr[c]) for c in data_cols) if v is not None]
+            if positive:
+                anyv = [v for v in anyv if v > 0]
+            return anyv[-1] if anyv else None
 
-        roe = last_num("ROE")
+        roe = latest("ROE")
         if roe is not None:
             out["roeAnnual"] = r1(roe)
 
-        # EPS YoY: 연간 칼럼에서 추정치(E) 제외한 실적 2개로 계산
+        # EPS 성장: 분기 YoY > 분기 QoQ > 연간 YoY
         eps_row = row("EPS")
         if eps_row is not None:
-            actual = [(c, _to_num(eps_row[c])) for c in annual_cols if "(E)" not in c]
-            actual = [(c, v) for c, v in actual if v is not None]
+            qv, av = actuals(eps_row, q_cols), actuals(eps_row, a_cols)
             pair = None
-            if len(actual) >= 2:
-                pair = (actual[-2][1], actual[-1][1])
-            elif len(actual) == 1:  # 실적 1개뿐이면 추정치와 비교
-                est = [_to_num(eps_row[c]) for c in annual_cols if "(E)" in c]
-                est = [v for v in est if v is not None]
-                if est:
-                    pair = (actual[-1][1], est[-1])
+            if len(qv) >= 5:
+                pair = (qv[-5], qv[-1])        # 분기 YoY (4분기 전 대비)
+            elif len(qv) >= 2:
+                pair = (qv[-2], qv[-1])        # 분기 QoQ
+            elif len(av) >= 2:
+                pair = (av[-2], av[-1])        # 연간 YoY
             if pair and pair[0] not in (0, None):
                 out["epsGrowthQoQ"] = r1((pair[1] - pair[0]) / abs(pair[0]) * 100)
                 out["epsAccelQuarters"] = 2 if out["epsGrowthQoQ"] > 0 else 0
 
-        per = last_num("PER")
-        if per is not None and per > 0:
+        per = latest("PER", positive=True)
+        if per is not None:
             out["per"] = r1(per)
-        pbr = last_num("PBR")
-        if pbr is not None and pbr > 0:
+        pbr = latest("PBR", positive=True)
+        if pbr is not None:
             out["pbr"] = r1(pbr)
-        div = last_num("시가배당")   # 시가배당률(%) — 주당배당금이 아님
-        if div is not None:
+        div = latest("시가배당")   # 시가배당률(%)
+        if div is not None and div > 0:
             out["dividendYield"] = r1(div)
-        debt = last_num("부채비율")
-        if debt is not None:
+        debt = latest("부채비율")
+        if debt is not None and debt > 0:
             out["debtRatio"] = r1(debt)
     except Exception:
         pass
@@ -613,22 +622,22 @@ def _distLow(d):  return (d["price"] / d["low52w"] - 1) * 100
 def _dcfUp(d):    return (d["dcfFairValue"] / d["price"] - 1) * 100
 def _tgtUp(d):    return (d["targetPrice"] / d["price"] - 1) * 100
 
-_REGIME = {"STRONG_BULL": 80, "BULL": 62, "NEUTRAL": 45, "BEAR": 20}
-_OBV = {"up": 9, "flat": 0, "down": -25}
-_KAL = {"bullish": 75, "neutral": 37.5, "bearish": 15}
+_REGIME = {"STRONG_BULL": 85, "BULL": 68, "NEUTRAL": 50, "BEAR": 25}
+_OBV = {"up": 75, "flat": 50, "down": 25}          # 스마트머니: 점수로 직접 사용
+_KAL = {"bullish": 80, "neutral": 50, "bearish": 20}
 
 METRICS = [
-    dict(tag="C", title="EPS 가속도", sub="분기 순이익 성장 가속 여부",
-         score=lambda d: clamp(45 + d["epsGrowthQoQ"]/25 + (15 if d["epsAccelQuarters"] >= 2 else 0)),
-         comment=lambda d: f"지난 분기 순이익이 {'+' if d['epsGrowthQoQ']>=0 else ''}{r1(d['epsGrowthQoQ'])}% 변동했어요. " +
-                           ("연속 성장 중이에요." if d["epsAccelQuarters"] >= 2 else "가속 신호는 약해요.")),
-    dict(tag="A", title="연간 ROE 실적", sub="자기자본이익률 기준 충족 여부",
-         score=lambda d: clamp(12 + math.log2(max(d["roeAnnual"]/d["roeThreshold"], 1e-6))*4) if d["roeAnnual"] >= d["roeThreshold"]
-                         else clamp(d["roeAnnual"]/d["roeThreshold"]*35, 0, 40),
+    dict(tag="C", title="EPS 가속도", sub="분기 순이익 성장(최근 분기 기준)",
+         score=lambda d: clamp(50 + d["epsGrowthQoQ"]*0.4 + (10 if d["epsAccelQuarters"] >= 2 else 0)),
+         comment=lambda d: f"최근 분기 순이익이 {'+' if d['epsGrowthQoQ']>=0 else ''}{r1(d['epsGrowthQoQ'])}% 변동했어요. " +
+                           ("성장세예요." if d["epsAccelQuarters"] >= 2 else "성장 신호는 약해요.")),
+    dict(tag="A", title="ROE 실적", sub="자기자본이익률(최근 분기 기준)",
+         score=lambda d: clamp(55 + (d["roeAnnual"] - d["roeThreshold"]) * 1.8) if d["roeAnnual"] >= d["roeThreshold"]
+                         else clamp(d["roeAnnual"] / d["roeThreshold"] * 55, 0, 55),
          comment=lambda d: f"자기자본이익률(ROE) {r1(d['roeAnnual'])}%이고, 기준({r1(d['roeThreshold'])}%)을 " +
                            ("통과했어요. 돈을 잘 버는 회사예요." if d["roeAnnual"] >= d["roeThreshold"] else "미달이에요.")),
     dict(tag="N", title="신고가·피벗 돌파", sub="52주 최고가 및 패턴 돌파",
-         score=lambda d: clamp(50 - _distHigh(d)*4 + (5 if d["pivotBreak"] else 0)),
+         score=lambda d: clamp(95 - _distHigh(d)*3.5 + (5 if d["pivotBreak"] else 0)),
          comment=lambda d: f"52주 최고가에서 {r1(_distHigh(d))}% 아래에 있어요. " +
                            ("아직 신고가까지 거리가 있어요. " if _distHigh(d) > 3 else "신고가 부근이에요. ") +
                            ("컵앤핸들 피벗 돌파가 감지됐어요." if d["pivotBreak"] else "")),
@@ -638,83 +647,82 @@ METRICS = [
          comment=lambda d: f"거래량이 평소의 {r1(d['volumeRatioVsAvg'])}배예요. " +
                            ("거래량을 동반한 돌파가 확인됐어요." if d["breakoutSignal"]
                             else "아직 돌파 신호는 없어요(거래량 수준만 평가).")),
-    dict(tag="L", title="주도주 판별", sub="시장 대비 상대강도 측정",
-         score=lambda d: clamp(d["rsRating"] - 79),
+    dict(tag="L", title="주도주 판별", sub="시장 대비 상대강도(RS)",
+         score=lambda d: clamp(d["rsRating"]),
          comment=lambda d: f"시장 대비 상대강도(RS) {int(d['rsRating'])}점이에요. " +
-                           ("시장을 이끄는 주도주예요." if d["rsRating"] >= 80 else "주도력이 약해요.")),
+                           ("시장을 이끄는 주도주예요." if d["rsRating"] >= 80 else "주도력이 보통이에요." if d["rsRating"] >= 50 else "주도력이 약해요.")),
     dict(tag="I", title="기관 수급", sub="기관 자금의 매수-매도 흐름",
-         score=lambda d: clamp(d["mfi"]*0.84),
-         comment=lambda d: f"기관 자금 흐름: '{'매수 우위' if d['mfi']>=80 else '관망' if d['mfi']>=60 else '매도 우위'}'이에요. " +
-                           (f"매수 압력이 강해요 (MFI {int(d['mfi'])})." if d["mfi"] >= 60 else "")),
+         score=lambda d: clamp(d["mfi"]),
+         comment=lambda d: f"기관 자금 흐름: '{'매수 우위' if d['mfi']>=70 else '관망' if d['mfi']>=45 else '매도 우위'}'이에요 (MFI {int(d['mfi'])})."),
     dict(tag="M", title="시장 방향", sub="전체 시장 추세와 방향성",
-         score=lambda d: clamp(_REGIME.get(d["marketRegime"], 45) + clamp(d["adx"]-25, 0, 25)*0.64),
-         comment=lambda d: f"현재 시장 방향: '[M] {d['marketRegime']} ✅'이에요. 추세 강도 ADX {int(d['adx'])}."),
+         score=lambda d: clamp(_REGIME.get(d["marketRegime"], 50) + clamp(d["adx"]-20, 0, 30)*0.5),
+         comment=lambda d: f"현재 시장 방향: '[M] {d['marketRegime']}'이에요. 추세 강도 ADX {int(d['adx'])}."),
     dict(tag="Quant", title="가치·퀄리티 팩터", sub="저평가+고품질 종목 선별",
-         score=lambda d: clamp(73 + d["factorAlpha"]),
+         score=lambda d: clamp(60 + d["factorAlpha"]*1.5),
          comment=lambda d: f"가치·퀄리티 팩터 알파 {'+' if d['factorAlpha']>=0 else ''}{r1(d['factorAlpha'])}점이에요. " +
-                           ("저평가 매력이 있어요." if d["factorAlpha"] > 0 else "프리미엄 구간이에요.")),
-    dict(tag="Quant", title="평균 회귀", sub="RSI·Z-Score 기반 반등/조정 가능성",
-         score=lambda d: clamp(60 - d["zScoreMeanRev"]*17.33),
+                           ("저평가 매력이 있어요." if d["factorAlpha"] > 0 else "중립이에요." if d["factorAlpha"] == 0 else "프리미엄 구간이에요.")),
+    dict(tag="Quant", title="평균 회귀", sub="RSI·Z-Score 기반(과매도=기회)",
+         score=lambda d: clamp(60 - d["zScoreMeanRev"]*15),
          comment=lambda d: f"RSI {int(d['rsi'])}로 {'과매수' if d['rsi']>=70 else '과매도' if d['rsi']<=30 else '중립'} 구간이에요. " +
-                           ("단기 조정 가능성이 있어요. " if d["zScoreMeanRev"] >= 1.5 else "") + f"Z-Score +{r1(d['zScoreMeanRev'])}."),
+                           ("단기 조정 가능성이 있어요. " if d["zScoreMeanRev"] >= 1.5 else "되돌림 여유가 있어요. " if d["zScoreMeanRev"] <= -1 else "") + f"Z-Score {'+' if d['zScoreMeanRev']>=0 else ''}{r1(d['zScoreMeanRev'])}."),
     dict(tag="Quant", title="모멘텀", sub="12개월 수익률 기반 추세 지속력",
-         score=lambda d: clamp(40 + d["return12m"]/20),
-         comment=lambda d: f"1년간 수익률 +{r1(d['return12m'])}%로 모멘텀이 {'강해요' if d['return12m']>100 else '보통이에요'}."),
+         score=lambda d: clamp(50 + d["return12m"]*0.35),
+         comment=lambda d: f"1년간 수익률 {'+' if d['return12m']>=0 else ''}{r1(d['return12m'])}%로 모멘텀이 {'강해요' if d['return12m']>50 else '보통이에요' if d['return12m']>0 else '약해요'}."),
     dict(tag="Quant", title="다중 시간대", sub="단기·중기·장기 추세 종합",
-         score=lambda d: clamp(45 + d["alignedTimeframes"]*10),
-         comment=lambda d: f"단기·중기·장기 추세 종합: {'상승' if d['alignedTimeframes']>=2 else '혼조'} 추세예요."),
+         score=lambda d: clamp(40 + d["alignedTimeframes"]*20),
+         comment=lambda d: f"단기·중기·장기 추세 종합: {'상승' if d['alignedTimeframes']>=2 else '혼조'} 추세예요 (정렬 {d['alignedTimeframes']}/3)."),
     dict(tag="Quant", title="낙폭 위험도", sub="최근 최대 하락폭(MDD) 평가",
-         score=lambda d: clamp(100 - abs(d["mddPct"])*7.3),
-         comment=lambda d: f"최근 최대 낙폭(MDD) {r1(d['mddPct'])}%이에요. 위험도는 '{'낮음' if abs(d['mddPct'])<7 else '보통' if abs(d['mddPct'])<15 else '높음'}'으로 평가돼요."),
+         score=lambda d: clamp(100 - abs(d["mddPct"])*4),
+         comment=lambda d: f"최근 최대 낙폭(MDD) {r1(d['mddPct'])}%이에요. 위험도는 '{'낮음' if abs(d['mddPct'])<10 else '보통' if abs(d['mddPct'])<20 else '높음'}'으로 평가돼요."),
     dict(tag="Quant", title="스마트머니 흐름", sub="기관 자금 흐름과 OBV 추세",
-         score=lambda d: clamp(50 + _OBV.get(d["obvTrend"], 0)),
+         score=lambda d: _OBV.get(d["obvTrend"], 50),
          comment=lambda d: "스마트머니 흐름 — OBV 추세: " + {"up": "상승", "flat": "횡보", "down": "하락"}.get(d["obvTrend"], "횡보") + "이에요."),
     dict(tag="Quant", title="DCF 적정가", sub="DCF 적정가 대비 상승 여력",
-         score=lambda d: clamp(50 + _dcfUp(d)*0.44),
-         comment=lambda d: f"DCF 적정가 대비 상승 여력 +{r1(_dcfUp(d))}%이에요. 전망은 '{'강력 매수' if _dcfUp(d)>30 else '매수' if _dcfUp(d)>0 else '관망'}'예요."),
+         score=lambda d: clamp(50 + _dcfUp(d)*0.5),
+         comment=lambda d: f"DCF 적정가 대비 상승 여력 {'+' if _dcfUp(d)>=0 else ''}{r1(_dcfUp(d))}%이에요. 전망은 '{'강력 매수' if _dcfUp(d)>30 else '매수' if _dcfUp(d)>0 else '관망'}'예요."),
     dict(tag="Quant", title="공매도 비율", sub="공매도 부담 수준 평가",
-         score=lambda d: clamp(50 - d["shortRatioPct"]*5),
-         comment=lambda d: f"공매도 비율 {r1(d['shortRatioPct'])}%로 위험도는 '{'NORMAL' if d['shortRatioPct']<5 else 'HIGH'}'이에요."),
+         score=lambda d: clamp(75 - d["shortRatioPct"]*7),
+         comment=lambda d: f"공매도 비율 {r1(d['shortRatioPct'])}%로 부담은 '{'낮음' if d['shortRatioPct']<5 else '높음'}'이에요."),
     dict(tag="Math", title="허스트 지수", sub="추세 지속성과 방향 예측력",
-         score=lambda d: clamp(50 + (d["hurst"]-0.5)*144),
+         score=lambda d: clamp(50 + (d["hurst"]-0.5)*160),
          comment=lambda d: f"허스트 지수 {r1(d['hurst'])}로 '{'강한 추세' if d['hurst']>0.55 else '평균회귀' if d['hurst']<0.45 else '랜덤워크'}'를 나타내요."),
     dict(tag="Math", title="칼만 필터", sub="노이즈 제거 후 추세 신호",
-         score=lambda d: _KAL.get(d["kalmanSignal"], 37.5),
+         score=lambda d: _KAL.get(d["kalmanSignal"], 50),
          comment=lambda d: "칼만 필터 신호: " + {"bullish": "상승", "neutral": "중립", "bearish": "하락"}.get(d["kalmanSignal"], "중립") + "이에요."),
     dict(tag="Math", title="통계적 Z-Score", sub="통계적 과매수/과매도 위치",
-         score=lambda d: clamp(50 - (abs(d["zScoreStat"])-1.2)*20),
-         comment=lambda d: f"통계적 Z-Score +{r1(d['zScoreStat'])}이에요. {'정상 범위예요.' if abs(d['zScoreStat'])<1.5 else '극단 구간이에요.'}"),
+         score=lambda d: clamp(65 - d["zScoreStat"]*12),
+         comment=lambda d: f"통계적 Z-Score {'+' if d['zScoreStat']>=0 else ''}{r1(d['zScoreStat'])}이에요. {'과매수 구간' if d['zScoreStat']>1.5 else '과매도 구간' if d['zScoreStat']<-1.5 else '정상 범위'}예요."),
     dict(tag="Adj", title="변동성 조정", sub="낙폭 대비 수익률 효율(칼마형)",
          score=lambda d: clamp(40 + (d["return12m"] / max(abs(d["mddPct"]), 1.0)) * 8),
          comment=lambda d: f"12개월 수익률 {r1(d['return12m'])}% 대비 최대낙폭 {r1(d['mddPct'])}% — "
                            f"위험 대비 효율이 {'높아요' if (d['return12m']/max(abs(d['mddPct']),1))>=2 else '보통이에요' if (d['return12m']/max(abs(d['mddPct']),1))>=0.5 else '낮아요'}."),
     dict(tag="Sentiment", title="시장 심리 추정", sub="가격·거래량 기반 투자 심리",
-         score=lambda d: clamp(55 + (d["upVolPct"]-50) + (d["closeStrength"]-50)*0.6 + d["gapDir"]*8),
-         comment=lambda d: f"가격·거래량으로 추정한 심리는 '{'약한 상승' if d['upVolPct']>=60 else '중립'}'이에요. 상승 거래량 {int(d['upVolPct'])}%, 종가 강도 {int(d['closeStrength'])}%."),
+         score=lambda d: clamp(50 + (d["upVolPct"]-50)*0.8 + (d["closeStrength"]-50)*0.6 + d["gapDir"]*5),
+         comment=lambda d: f"가격·거래량으로 추정한 심리는 '{'상승 우위' if d['upVolPct']>=60 else '중립'}'이에요. 상승 거래량 {int(d['upVolPct'])}%, 종가 강도 {int(d['closeStrength'])}%."),
 
     # ---------------- 가치투자 (Value) ----------------
     dict(tag="Value", title="PER 밸류", sub="이익 대비 주가(낮을수록 저평가)",
-         score=lambda d: clamp(100 - (d["per"] - 5) * 4),
-         comment=lambda d: f"PER {r1(d['per'])}배예요. {'저평가 구간' if d['per']<10 else '적정' if d['per']<20 else '고평가 구간'}이에요."),
+         score=lambda d: clamp(105 - d["per"]*4) if d["per"] > 0 else 20,
+         comment=lambda d: f"PER {r1(d['per'])}배예요. {'저평가 구간' if 0<d['per']<10 else '적정' if d['per']<20 else '고평가 구간' if d['per']>0 else '적자(PER 의미 없음)'}이에요."),
     dict(tag="Value", title="PBR 밸류", sub="순자산 대비 주가(낮을수록 저평가)",
-         score=lambda d: clamp(100 - (d["pbr"] - 0.5) * 30),
+         score=lambda d: clamp(100 - d["pbr"]*25),
          comment=lambda d: f"PBR {r1(d['pbr'])}배예요. {'자산가치 대비 싸요' if d['pbr']<1 else '적정' if d['pbr']<2.5 else '프리미엄 구간'}이에요."),
     dict(tag="Value", title="배당 매력", sub="시가배당률",
-         score=lambda d: clamp(d["dividendYield"] * 18),
+         score=lambda d: clamp(d["dividendYield"] * 20),
          comment=lambda d: f"시가배당률 {r1(d['dividendYield'])}%예요. {'배당 매력이 높아요' if d['dividendYield']>=3 else '배당은 보통이에요' if d['dividendYield']>0 else '배당이 거의 없어요'}."),
     dict(tag="Value", title="재무 안정성", sub="부채비율(낮을수록 안전)",
-         score=lambda d: clamp(110 - d["debtRatio"]),
+         score=lambda d: clamp(120 - d["debtRatio"]*0.8),
          comment=lambda d: f"부채비율 {r1(d['debtRatio'])}%예요. {'재무가 탄탄해요' if d['debtRatio']<50 else '보통이에요' if d['debtRatio']<100 else '부채 부담이 있어요'}."),
     dict(tag="Value", title="안전마진", sub="DCF 적정가 대비 괴리",
          score=lambda d: clamp(50 + _dcfUp(d) * 0.5),
-         comment=lambda d: f"적정가 대비 +{r1(_dcfUp(d))}%의 안전마진이에요. {'매력적' if _dcfUp(d)>20 else '보통' if _dcfUp(d)>0 else '여유 없음'}이에요."),
+         comment=lambda d: f"적정가 대비 {'+' if _dcfUp(d)>=0 else ''}{r1(_dcfUp(d))}%의 안전마진이에요. {'매력적' if _dcfUp(d)>20 else '보통' if _dcfUp(d)>0 else '여유 없음'}이에요."),
     dict(tag="Value", title="성장 대비 밸류(PEG)", sub="PER ÷ 이익성장률",
-         score=lambda d: clamp(100 - d["pegRatio"] * 40),
+         score=lambda d: clamp(100 - d["pegRatio"] * 35),
          comment=lambda d: f"PEG {r1(d['pegRatio'])}예요. {'성장 대비 저평가' if d['pegRatio']<1 else '적정' if d['pegRatio']<2 else '성장 대비 비쌈'}이에요."),
 
     # ---------------- 매크로 (시장 환경) ----------------
     dict(tag="Macro", title="시장 추세", sub="KOSPI 국면",
-         score=lambda d: {"STRONG_BULL": 90, "BULL": 70, "NEUTRAL": 45, "BEAR": 20}.get(d["marketRegime"], 45),
+         score=lambda d: {"STRONG_BULL": 90, "BULL": 70, "NEUTRAL": 50, "BEAR": 25}.get(d["marketRegime"], 50),
          comment=lambda d: f"전체 시장은 '{d['marketRegime']}' 국면이에요. {'위험자산에 우호적' if 'BULL' in d['marketRegime'] else '신중 구간'}이에요."),
     dict(tag="Macro", title="환율(USD/KRW)", sub="원화 방향(약세=위험회피)",
          score=lambda d: {"down": 75, "flat": 52, "up": 32}.get(d["usdkrwTrend"], 50),
@@ -723,7 +731,7 @@ METRICS = [
          score=lambda d: {"down": 75, "flat": 55, "up": 35}.get(d["rateTrend"], 55),
          comment=lambda d: "금리가 " + {"down": "하락(완화) — 주식에 우호적", "flat": "횡보 — 중립", "up": "상승(긴축) — 밸류에 부담"}.get(d["rateTrend"], "중립") + "이에요."),
     dict(tag="Macro", title="변동성(VIX)", sub="공포지수(낮을수록 안정)",
-         score=lambda d: clamp(100 - (d["vix"] - 10) * 3),
+         score=lambda d: clamp(115 - d["vix"] * 3),
          comment=lambda d: f"VIX {r1(d['vix'])}예요. {'시장이 안정적' if d['vix']<20 else '경계 구간' if d['vix']<30 else '공포 구간'}이에요."),
 ]
 
@@ -757,7 +765,7 @@ def compute_all(d: dict) -> dict:
     valueAvg = (get("가치·퀄리티 팩터") + get("DCF 적정가")) / 2
     momNet = (get("모멘텀") + get("평균 회귀")) / 2
     supplyAvg = (get("기관 수급") + get("스마트머니 흐름")) / 2
-    fundAvg = (get("EPS 가속도") + get("연간 ROE 실적")) / 2
+    fundAvg = (get("EPS 가속도") + get("ROE 실적")) / 2
     riskAvg = (get("낙폭 위험도") + get("공매도 비율")) / 2
     composite_tech = round(0.24*regimeAvg + 0.18*valueAvg + 0.14*momNet
                            + 0.14*supplyAvg + 0.14*fundAvg + 0.16*riskAvg)
@@ -772,11 +780,11 @@ def compute_all(d: dict) -> dict:
         return round(sum(vals) / len(vals)) if vals else 0
 
     styles = {
-        "CAN SLIM": avg_titles(["EPS 가속도", "연간 ROE 실적", "신고가·피벗 돌파",
+        "CAN SLIM": avg_titles(["EPS 가속도", "ROE 실적", "신고가·피벗 돌파",
                                 "거래량 확인 돌파", "주도주 판별", "기관 수급", "시장 방향"]),
         "가치": avg_tag("Value"),
         "모멘텀": avg_titles(["모멘텀", "다중 시간대", "주도주 판별", "신고가·피벗 돌파"]),
-        "퀄리티": avg_titles(["연간 ROE 실적", "가치·퀄리티 팩터", "재무 안정성"]),
+        "퀄리티": avg_titles(["ROE 실적", "가치·퀄리티 팩터", "재무 안정성"]),
         "매크로": avg_tag("Macro"),
     }
     # ---- 스타일 통합 종합 점수 (가중치는 자유 튜닝 가능) ----
