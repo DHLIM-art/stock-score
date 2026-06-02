@@ -345,43 +345,66 @@ def _to_num(x):
         return None
 
 def _parse_naver_fin(fin):
-    """네이버 '기업실적분석' 표 → dict(roe, epsg, per, pbr, div, debt)."""
+    """네이버 '기업실적분석' 표 → dict(roe, epsGrowthQoQ, per, pbr, dividendYield, debtRatio).
+    EPS 성장은 연간 실적(추정치 'E' 제외)의 YoY로 계산해 안정적으로."""
     out = {}
     try:
-        cols = fin.columns
+        cols = [(" ".join(map(str, c)) if isinstance(c, tuple) else str(c)) for c in fin.columns]
         fin = fin.copy()
-        fin.columns = [(" ".join(map(str, c)) if isinstance(c, tuple) else str(c)) for c in cols]
-        label_col = fin.columns[0]
+        fin.columns = cols
+        label_col = cols[0]
         labels = fin[label_col].astype(str)
+        data_cols = cols[1:]
+        annual_cols = [c for c in data_cols if "연간" in c] or data_cols  # 연간 칼럼 우선
 
-        def row_vals(key):
+        def row(key):
             idx = labels[labels.str.contains(key, na=False)].index
-            if len(idx) == 0:
-                return []
-            vals = [_to_num(v) for v in fin.loc[idx[0]].tolist()[1:]]
-            return [v for v in vals if v is not None]
+            return fin.loc[idx[0]] if len(idx) else None
 
-        def last(key):
-            v = row_vals(key)
-            return v[-1] if v else None
+        def last_num(key, columns=None):
+            rr = row(key)
+            if rr is None:
+                return None
+            use = columns if columns is not None else annual_cols
+            actual = [_to_num(rr[c]) for c in use if "(E)" not in c]
+            actual = [v for v in actual if v is not None]
+            if actual:
+                return actual[-1]               # 최근 연간 실적 우선
+            anyv = [_to_num(rr[c]) for c in use]
+            anyv = [v for v in anyv if v is not None]
+            return anyv[-1] if anyv else None    # 없으면 추정치라도
 
-        roe = last("ROE")
+        roe = last_num("ROE")
         if roe is not None:
             out["roeAnnual"] = r1(roe)
-        ev = row_vals("EPS")
-        if len(ev) >= 2 and ev[-2] not in (0, None):
-            out["epsGrowthQoQ"] = r1((ev[-1] - ev[-2]) / abs(ev[-2]) * 100)
-            out["epsAccelQuarters"] = 2 if out["epsGrowthQoQ"] > 0 else 0
-        per = last("PER")
+
+        # EPS YoY: 연간 칼럼에서 추정치(E) 제외한 실적 2개로 계산
+        eps_row = row("EPS")
+        if eps_row is not None:
+            actual = [(c, _to_num(eps_row[c])) for c in annual_cols if "(E)" not in c]
+            actual = [(c, v) for c, v in actual if v is not None]
+            pair = None
+            if len(actual) >= 2:
+                pair = (actual[-2][1], actual[-1][1])
+            elif len(actual) == 1:  # 실적 1개뿐이면 추정치와 비교
+                est = [_to_num(eps_row[c]) for c in annual_cols if "(E)" in c]
+                est = [v for v in est if v is not None]
+                if est:
+                    pair = (actual[-1][1], est[-1])
+            if pair and pair[0] not in (0, None):
+                out["epsGrowthQoQ"] = r1((pair[1] - pair[0]) / abs(pair[0]) * 100)
+                out["epsAccelQuarters"] = 2 if out["epsGrowthQoQ"] > 0 else 0
+
+        per = last_num("PER")
         if per is not None and per > 0:
             out["per"] = r1(per)
-        pbr = last("PBR")
+        pbr = last_num("PBR")
         if pbr is not None and pbr > 0:
             out["pbr"] = r1(pbr)
-        div = last("배당")  # 시가배당률(%)
+        div = last_num("시가배당")   # 시가배당률(%) — 주당배당금이 아님
         if div is not None:
             out["dividendYield"] = r1(div)
-        debt = last("부채비율")
+        debt = last_num("부채비율")
         if debt is not None:
             out["debtRatio"] = r1(debt)
     except Exception:
@@ -676,11 +699,12 @@ def compute_all(d: dict) -> dict:
                               - (8 if d["zScoreMeanRev"] >= 2 else 0), 0, 100))
 
     a = d["atr"]
-    buy = round(d["price"] - 1.95*a)
-    stop = round(buy - 0.25*a)
-    t1 = round(d["targetPrice"] + 7.65*a)
-    t2 = round(d["dcfFairValue"] + 7.78*a)
-    rr = r1((t1 - buy) / (buy - stop)) if (buy - stop) > 0 else 0.0
+    buy = round(d["price"] - 1.0 * a)        # 눌림목 대기: 현재가 − 1 ATR
+    stop = round(buy - 2.0 * a)              # 변동성 기반 손절: 매수 − 2 ATR
+    risk = buy - stop                        # = 2 ATR
+    t1 = round(buy + 2.0 * risk)             # 1차 익절: 손익비 2:1
+    t2 = round(buy + 3.0 * risk)             # 2차 익절: 손익비 3:1
+    rr = r1(2.0) if risk > 0 else 0.0        # 1차 익절 기준 손익비
 
     verdict = ("강력 매수" if composite >= 80 else "매집" if composite >= 60
                else "관망" if composite >= 40 else "회피")
