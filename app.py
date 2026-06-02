@@ -54,6 +54,8 @@ EDITABLE = ["price", "roeAnnual", "roeThreshold", "epsGrowthQoQ", "epsAccelQuart
             "per", "pbr", "dividendYield", "debtRatio", "vix"]
 
 # ---------------------------------------------------------------- 상태 초기화
+DEFAULT_DART_KEY = "446382e4a311584f2d896d828579a469e84295a3"  # DART 인증키(자동 사용)
+
 def do_load():
     """티커 입력칸 Enter 또는 버튼 클릭 시 실행되는 콜백."""
     ticker = (st.session_state.get("tk_input") or "").strip()
@@ -68,9 +70,6 @@ def do_load():
     st.session_state.fetched = True
     for k in EDITABLE:
         st.session_state[k] = base.get(k, S.DEFAULTS[k])
-    # 최근 검색 기록 갱신 (중복 제거, 최신순, 최대 8개) — 세션 동안 유지
-    hist = [ticker] + [h for h in st.session_state.get("history", []) if h != ticker]
-    st.session_state.history = hist[:8]
 
 if "base" not in st.session_state:
     st.session_state.base = dict(S.DEFAULTS)
@@ -81,11 +80,10 @@ if "base" not in st.session_state:
     st.session_state.period = 400
     st.session_state.cmp_codes = ""
     st.session_state.peer_warn = []
-    st.session_state.history = []
     try:
-        st.session_state.dart_key = st.secrets.get("DART_API_KEY", "")
+        st.session_state.dart_key = st.secrets.get("DART_API_KEY", "") or DEFAULT_DART_KEY
     except Exception:
-        st.session_state.dart_key = ""
+        st.session_state.dart_key = DEFAULT_DART_KEY
     for k in EDITABLE:
         st.session_state[k] = S.DEFAULTS[k]
     # 첫 진입 시 삼성전자를 자동으로 불러오기
@@ -116,29 +114,37 @@ def sample_series(price):
     return df
 
 # ---------------------------------------------------------------- 사이드바
+@st.cache_data(ttl=86400, show_spinner="종목 목록 불러오는 중...")
+def load_universe():
+    uni = S.build_universe()
+    labels = [f"{u['name']} ({u['symbol']}) · {u['market']}" for u in uni]
+    mapping = {lab: u["symbol"] for lab, u in zip(labels, uni)}
+    return labels, mapping
+
 with st.sidebar:
     st.markdown("### 종목 평가")
-    st.text_input("종목코드 또는 종목명  (입력 후 Enter)", key="tk_input", on_change=do_load,
-                  help="6자리 코드(예 005930) · 정확한 종목명(예 삼성전자) · 해외 티커(예 AAPL)")
 
-    # 최근 검색 기록 (세션 동안 유지) — 골라서 바로 다시 조회
-    _HIST_PLACEHOLDER = "— 최근 검색 기록 —"
-    def pick_history():
-        v = st.session_state.get("hist_pick")
-        if v and v != _HIST_PLACEHOLDER:
-            st.session_state.tk_input = v
-            do_load()
-    if st.session_state.get("history"):
-        st.selectbox("📜 최근 검색", [_HIST_PLACEHOLDER] + st.session_state.history,
-                     key="hist_pick", on_change=pick_history)
+    # 이름·티커로 검색해서 고르기 (코스피·코스닥·미국)
+    try:
+        _uni_labels, _uni_map = load_universe()
+    except Exception:
+        _uni_labels, _uni_map = [], {}
+    if _uni_labels:
+        def pick_stock():
+            lab = st.session_state.get("uni_pick")
+            sym = _uni_map.get(lab)
+            if sym:
+                st.session_state.tk_input = sym
+                do_load()
+        st.selectbox("🔎 종목 검색 (이름·티커)", _uni_labels, index=None,
+                     placeholder="이름이나 티커 입력해서 검색…",
+                     key="uni_pick", on_change=pick_stock)
+
+    st.text_input("직접 입력 (코드·종목명·티커)", key="tk_input", on_change=do_load,
+                  help="6자리 코드(예 005930) · 정확한 종목명(예 삼성전자) · 해외 티커(예 AAPL)")
 
     st.slider("데이터 기간(일)", 200, 700, step=50, key="period")
     st.button("📡 실데이터 불러오기", use_container_width=True, type="primary", on_click=do_load)
-
-    with st.expander("🔑 DART 연동 (정확한 한국 재무)"):
-        st.text_input("DART API 키", key="dart_key", type="password",
-                      help="opendart.fss.or.kr 에서 무료 발급. 입력 후 다시 불러오면 ROE·부채·순이익을 공시 기준으로 사용해요.")
-        st.caption("키를 넣으면 ROE·부채비율·순이익성장이 금감원 공시(분기) 기준으로 계산됩니다.")
 
     if st.session_state.fetched:
         if st.session_state.df is not None:
