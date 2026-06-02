@@ -370,6 +370,47 @@ def fetch_name(ticker: str):
     return None
 
 
+_UNIVERSE = None
+def build_universe():
+    """검색용 종목 목록: 코스피·코스닥·미국(NASDAQ·NYSE·AMEX) 의 (종목명, 심볼, 시장).
+    미국 거래소에는 S&P500·다우·러셀 구성종목이 모두 포함됨. 재무 데이터는 미포함."""
+    global _UNIVERSE
+    if _UNIVERSE is not None:
+        return _UNIVERSE
+    rows = []
+    try:
+        import FinanceDataReader as fdr
+        specs = [("KOSPI", "코스피"), ("KOSDAQ", "코스닥"),
+                 ("NASDAQ", "나스닥"), ("NYSE", "NYSE"), ("AMEX", "AMEX")]
+        for market, label in specs:
+            try:
+                lst = fdr.StockListing(market)
+                cc = "Symbol" if "Symbol" in lst.columns else ("Code" if "Code" in lst.columns else None)
+                nc = "Name" if "Name" in lst.columns else None
+                if not cc or not nc:
+                    continue
+                kr = market in ("KOSPI", "KOSDAQ")
+                for sym, nm in zip(lst[cc].astype(str), lst[nc].astype(str)):
+                    sym, nm = sym.strip(), nm.strip()
+                    if not sym or not nm or nm.lower() == "nan":
+                        continue
+                    if kr:
+                        sym = sym.zfill(6)
+                    rows.append((nm, sym, label))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    seen, uni = set(), []
+    for nm, sym, mk in rows:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        uni.append({"name": nm, "symbol": sym, "market": mk})
+    _UNIVERSE = uni
+    return uni
+
+
 def resolve_ticker(query: str):
     """입력을 종목코드로 변환. 6자리코드/해외티커는 그대로, 한글 종목명은 '정확히 일치'할 때만 코드로.
     반환: (코드 또는 None, 경고 또는 None)."""
