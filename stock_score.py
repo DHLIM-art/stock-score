@@ -12,6 +12,9 @@ stock_score.py  —  매수 평가 점수 엔진 (Windows PC 버전)
 from __future__ import annotations
 import math
 import sys
+
+ENGINE_VERSION = "v5 (2026-06-02, ROE=TTM)"  # 배포 확인용 — 화면에 표시됨
+
 import numpy as np
 import pandas as pd
 

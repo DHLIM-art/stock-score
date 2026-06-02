@@ -14,6 +14,13 @@ import stock_score as S
 st.set_page_config(page_title="매수 평가 대시보드", layout="wide",
                    initial_sidebar_state="expanded")
 
+# 배포 버전 배너 (새 코드가 도는지 즉시 확인용)
+st.markdown(
+    f"<div style='background:#1F3A5F;color:#fff;padding:6px 12px;border-radius:8px;"
+    f"font-size:13px;font-weight:700;margin-bottom:8px;text-align:center'>"
+    f"⚙️ 엔진 빌드 {S.ENGINE_VERSION}</div>",
+    unsafe_allow_html=True)
+
 # ---------------------------------------------------------------- 스타일
 st.markdown("""
 <style>
@@ -123,7 +130,7 @@ def load_universe(dart_key):
 
 with st.sidebar:
     st.markdown("### 종목 평가")
-    st.caption("엔진 v2026.06.02-ROE-TTM")
+    st.caption(f"엔진 빌드 {S.ENGINE_VERSION}")
 
     # 이름·티커로 검색해서 고르기 (코스피·코스닥·미국)
     try:
