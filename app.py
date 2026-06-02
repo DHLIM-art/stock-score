@@ -134,14 +134,14 @@ with st.sidebar:
             lab = st.session_state.get("uni_pick")
             sym = _uni_map.get(lab)
             if sym:
-                st.session_state.tk_input = sym
-                do_load()
+                st.session_state.tk_input = sym   # 검색창에 채워만 둠 (불러오기는 버튼으로)
         st.selectbox("🔎 종목 검색 (이름·티커)", _uni_labels, index=None,
                      placeholder="이름이나 티커 입력해서 검색…",
                      key="uni_pick", on_change=pick_stock)
 
-    st.text_input("직접 입력 (코드·종목명·티커)", key="tk_input", on_change=do_load,
-                  help="6자리 코드(예 005930) · 정확한 종목명(예 삼성전자) · 해외 티커(예 AAPL)")
+    st.text_input("선택/입력된 종목 (코드·종목명·티커)", key="tk_input",
+                  help="검색에서 고르면 자동으로 채워져요. 직접 입력도 가능. 입력 후 아래 버튼을 누르세요.")
+    st.caption("👇 종목을 정한 뒤 눌러서 데이터를 가져오세요.")
 
     st.slider("데이터 기간(일)", 200, 700, step=50, key="period")
     st.button("📡 실데이터 불러오기", use_container_width=True, type="primary", on_click=do_load)
