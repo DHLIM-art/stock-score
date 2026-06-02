@@ -1152,8 +1152,12 @@ def compute_all(d: dict) -> dict:
     t2 = round(buy + 3.0 * risk)             # 2차 익절: 손익비 3:1
     rr = r1(2.0) if risk > 0 else 0.0        # 1차 익절 기준 손익비
 
-    verdict = ("강력 매수" if composite >= 80 else "매집" if composite >= 60
-               else "관망" if composite >= 40 else "회피")
+    verdict = ("강력 매수" if composite >= 80 else
+               "매수" if composite >= 68 else
+               "비중 확대" if composite >= 58 else
+               "관망" if composite >= 45 else
+               "비중 축소" if composite >= 35 else
+               "회피")
     return dict(metrics=m, cats=cats, composite=composite, composite_tech=composite_tech,
                 styles=styles, entryTiming=entryTiming,
                 buy=buy, stop=stop, t1=t1, t2=t2, rr=rr, verdict=verdict,

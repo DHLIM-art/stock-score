@@ -341,12 +341,23 @@ left, right = st.columns([1, 2.3], gap="medium")
 
 with left:
     v = res["composite"]
+    # 등급별 색상 (글자/배경/테두리/이모지)
+    VERDICT_STYLE = {
+        "강력 매수": ("#15803d", "#dcfce7", "#86efac", "🟢"),
+        "매수":      ("#16a34a", "#ecfdf5", "#a7f3d0", "🟢"),
+        "비중 확대": ("#0d9488", "#ccfbf1", "#5eead4", "🔵"),
+        "관망":      ("#c2410c", "#fff7ed", "#fed7aa", "🟡"),
+        "비중 축소": ("#dc2626", "#fef2f2", "#fecaca", "🟠"),
+        "회피":      ("#b91c1c", "#fee2e2", "#fca5a5", "🔴"),
+    }
+    vt, vbg, vbd, vemoji = VERDICT_STYLE.get(res["verdict"], ("#c2410c", "#fff7ed", "#fed7aa", "⭐"))
     st.markdown(
         f"<div class='card'><div class='cat-name'>종합 점수</div>"
-        f"<div style='font-size:46px;font-weight:900;color:{ORANGE};line-height:1'>{v}"
+        f"<div style='font-size:46px;font-weight:900;color:{vt};line-height:1'>{v}"
         f"<span style='font-size:15px;color:{SLATE}'> 점</span></div>"
-        f"<div style='background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;border-radius:8px;"
-        f"padding:6px 10px;font-size:12.5px;font-weight:700;margin:8px 0 12px'>⭐ 관찰 LIST — {res['verdict']}</div>"
+        f"<div style='background:{vbg};color:{vt};border:1px solid {vbd};border-radius:8px;"
+        f"padding:6px 10px;font-size:13px;font-weight:800;margin:8px 0 12px;text-align:center'>"
+        f"{vemoji} {res['verdict']}</div>"
         f"<div class='row'><span style='color:{SLATE}'>현재가</span><b>{won(d['price'])}</b></div>"
         f"<div class='row'><span style='color:{SLATE}'>등락률</span>"
         f"<b style='color:{GREEN if d['changePct']>=0 else RED}'>{'+' if d['changePct']>0 else ''}{S.r1(d['changePct'])}%</b></div>"
