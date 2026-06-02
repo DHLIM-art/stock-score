@@ -51,14 +51,22 @@ if "base" not in st.session_state:
     st.session_state.base = dict(S.DEFAULTS)
     st.session_state.df = None
     st.session_state.warns = []
+    st.session_state.fetched = False
+    st.session_state.tk_input = S.DEFAULTS["ticker"]
+    st.session_state.period = 400
     for k in EDITABLE:
         st.session_state[k] = S.DEFAULTS[k]
 
-def load(ticker, period):
-    base, df, warns = S.build_inputs(ticker, period_days=period)
+def do_load():
+    """티커 입력칸 Enter 또는 버튼 클릭 시 실행되는 콜백."""
+    ticker = (st.session_state.get("tk_input") or "").strip()
+    if not ticker:
+        return
+    base, df, warns = S.build_inputs(ticker, period_days=int(st.session_state.get("period", 400)))
     st.session_state.base = base
     st.session_state.df = df
     st.session_state.warns = warns
+    st.session_state.fetched = True
     for k in EDITABLE:
         st.session_state[k] = base.get(k, S.DEFAULTS[k])
 
@@ -85,13 +93,17 @@ def sample_series(price):
 # ---------------------------------------------------------------- 사이드바
 with st.sidebar:
     st.markdown("### 종목 평가")
-    tk = st.text_input("종목코드 / 티커", value=st.session_state.base.get("ticker", "000660"),
-                       help="국내: 6자리 코드(예 000660) · 해외: 티커(예 AAPL)")
-    period = st.slider("데이터 기간(일)", 200, 700, 400, 50)
-    if st.button("📡 실데이터 불러오기", use_container_width=True, type="primary"):
-        with st.spinner("데이터 수집 중..."):
-            load(tk.strip(), period)
-        st.rerun()
+    st.text_input("종목코드 / 티커  (입력 후 Enter)", key="tk_input", on_change=do_load,
+                  help="국내: 6자리 코드(예 000660) · 해외: 티커(예 AAPL)")
+    st.slider("데이터 기간(일)", 200, 700, step=50, key="period")
+    st.button("📡 실데이터 불러오기", use_container_width=True, type="primary", on_click=do_load)
+
+    if st.session_state.fetched:
+        if st.session_state.df is not None:
+            b = st.session_state.base
+            st.success(f"✅ {b.get('name','')} 불러옴 · 현재가 {b['price']:,.0f}")
+        else:
+            st.error("⚠️ 가격 데이터를 못 가져왔어요. 티커/인터넷을 확인하거나 아래에서 직접 입력하세요.")
 
     st.divider()
     st.caption("입력값 수동 보정 (수집 안 되면 직접 입력)")
