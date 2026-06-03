@@ -648,6 +648,9 @@ def fetch_yf_fundamentals(ticker: str):
         tp = info.get("targetMeanPrice")
         if tp:
             out["targetPrice"] = float(tp)
+        sec = info.get("sector") or info.get("industry")
+        if sec:
+            out["sector"] = str(sec)
     except Exception as e:
         warns.append(f"yfinance 펀더멘털 생략: {e}")
     return out, warns
@@ -800,10 +803,15 @@ def _dart_accounts(corp, year, reprt_code, api_key):
         ni = grab({"당기순이익", "당기순이익(손실)"})
         eq = grab({"자본총계"})
         debt = grab({"부채총계"})
+        # 지배주주지분(있으면 PBR에 더 정확) — 명칭 편차 대응
+        eq_ctrl = grab({"지배기업소유주지분", "지배기업의소유주에게귀속되는자본",
+                        "지배주주지분", "자본(지배기업소유주지분)"})
         if ni is not None:
             out["당기순이익"] = ni
         if eq is not None:
             out["자본총계"] = eq
+        if eq_ctrl is not None:
+            out["지배주주자본"] = eq_ctrl
         if debt is not None:
             out["부채총계"] = debt
         return out or None
@@ -812,7 +820,8 @@ def _dart_accounts(corp, year, reprt_code, api_key):
 
 
 def _dart_shares(corp, year, reprt_code, api_key):
-    """DART 주식총수현황(stockTotqySttus)에서 유통주식수(보통주) 추정."""
+    """DART 주식총수현황에서 보통주 발행총수 반환(우선주 제외).
+    PER/PBR 분모는 회사 전체 순이익·자본과 짝이 맞아야 하므로 발행총수 기준."""
     try:
         import requests
         r = requests.get("https://opendart.fss.or.kr/api/stockTotqySttus.json",
@@ -821,18 +830,31 @@ def _dart_shares(corp, year, reprt_code, api_key):
         j = r.json()
         if j.get("status") != "000":
             return None
-        # '보통주' 행의 유통주식수(distb_stock_co) 우선, 없으면 발행주식총수(istc_totqy)
-        for it in j.get("list", []):
-            se = it.get("se", "")
-            if "보통주" in se or "합계" in se:
-                v = _to_num(it.get("distb_stock_co")) or _to_num(it.get("istc_totqy"))
+        rows = j.get("list", [])
+
+        def issued(it):
+            # 발행주식총수(istc_totqy)에서 자기주식 빼면 더 정확하나, 표기 편차가 커서 발행총수 사용
+            return _to_num(it.get("istc_totqy"))
+
+        # 1순위: '보통주' 행 (우선주/합계 제외)
+        for it in rows:
+            se = str(it.get("se", ""))
+            if "보통주" in se and "우선" not in se:
+                v = issued(it)
                 if v and v > 0:
                     return v
-        # 못 찾으면 첫 행
-        for it in j.get("list", []):
-            v = _to_num(it.get("istc_totqy"))
-            if v and v > 0:
-                return v
+        # 2순위: '합계' 행 (보통주 행이 없을 때)
+        for it in rows:
+            if "합계" in str(it.get("se", "")):
+                v = issued(it)
+                if v and v > 0:
+                    return v
+        # 3순위: 우선주가 아닌 첫 행
+        for it in rows:
+            if "우선" not in str(it.get("se", "")):
+                v = issued(it)
+                if v and v > 0:
+                    return v
     except Exception:
         pass
     return None
@@ -900,7 +922,8 @@ def fetch_dart(ticker, api_key, price=None):
                 if eps_ps > 0:
                     out["per"] = r1(price / eps_ps)        # PER = 주가 / 주당순이익
             if eq is not None and eq > 0:
-                bps = eq / shares
+                eq_for_pbr = accts.get("지배주주자본") or eq   # 지배주주지분 우선
+                bps = eq_for_pbr / shares
                 if bps > 0:
                     out["pbr"] = r1(price / bps)            # PBR = 주가 / 주당순자산
 
@@ -1035,6 +1058,40 @@ def _distLow(d):  return (d["price"] / d["low52w"] - 1) * 100
 def _dcfUp(d):    return (d["dcfFairValue"] / d["price"] - 1) * 100
 def _tgtUp(d):    return (d["targetPrice"] / d["price"] - 1) * 100
 
+# 섹터별 '정상' PER/PBR 기준선 (이 값이면 50점, 더 싸면 ↑ 더 비싸면 ↓)
+_SECTOR_BASE = {
+    "반도체":      (40, 6),   "semiconductor": (40, 6), "technology": (35, 8),
+    "소프트웨어":  (45, 9),   "software": (45, 9),       "communication": (25, 4),
+    "인터넷":      (40, 7),   "헬스케어":   (30, 5),     "healthcare": (30, 5),
+    "바이오":      (45, 7),   "소비재":     (22, 4),     "consumer": (22, 4),
+    "산업재":      (18, 3),   "industrial": (18, 3),     "금융":     (9,  1.0),
+    "financial":   (9, 1.0),  "은행":       (8,  0.8),   "에너지":   (12, 1.8),
+    "energy":      (12, 1.8), "소재":       (14, 2),     "유틸리티": (16, 1.5),
+}
+_DEFAULT_BASE = (18, 2.5)   # 섹터 불명 시 일반 기준
+
+def _sector_base(d):
+    s = str(d.get("sector", "")).lower()
+    for key, base in _SECTOR_BASE.items():
+        if key.lower() in s:
+            return base
+    return _DEFAULT_BASE
+
+def _per_score(d):
+    per = d.get("per", 0)
+    if not per or per <= 0:
+        return 25     # 적자(PER 의미 없음) — 약하게
+    base = _sector_base(d)[0]
+    # 기준선이면 55점, 절반 가격이면 ~90, 2배면 ~20 (섹터 보정)
+    return clamp(55 + (base - per) / base * 70)
+
+def _pbr_score(d):
+    pbr = d.get("pbr", 0)
+    if not pbr or pbr <= 0:
+        return 40
+    base = _sector_base(d)[1]
+    return clamp(55 + (base - pbr) / base * 70)
+
 def _roe_eff(d):
     """점수용 ROE = TTM(최근 1년) ROE. 최근 분기는 TTM에 이미 포함됨."""
     v = d.get("roeAnnual")
@@ -1122,12 +1179,16 @@ METRICS = [
          comment=lambda d: f"가격·거래량으로 추정한 심리는 '{'상승 우위' if d['upVolPct']>=60 else '중립'}'이에요. 상승 거래량 {int(d['upVolPct'])}%, 종가 강도 {int(d['closeStrength'])}%."),
 
     # ---------------- 가치투자 (Value) ----------------
-    dict(tag="Value", title="PER 밸류", sub="이익 대비 주가(낮을수록 저평가)",
-         score=lambda d: clamp(105 - d["per"]*4) if d["per"] > 0 else 20,
-         comment=lambda d: f"PER {r1(d['per'])}배예요. {'저평가 구간' if 0<d['per']<10 else '적정' if d['per']<20 else '고평가 구간' if d['per']>0 else '적자(PER 의미 없음)'}이에요."),
-    dict(tag="Value", title="PBR 밸류", sub="순자산 대비 주가(낮을수록 저평가)",
-         score=lambda d: clamp(100 - d["pbr"]*25),
-         comment=lambda d: f"PBR {r1(d['pbr'])}배예요. {'자산가치 대비 싸요' if d['pbr']<1 else '적정' if d['pbr']<2.5 else '프리미엄 구간'}이에요."),
+    dict(tag="Value", title="PER 밸류", sub="섹터 대비 이익 멀티플(낮을수록 저평가)",
+         score=lambda d: _per_score(d),
+         comment=lambda d: (f"PER {r1(d['per'])}배 (섹터 기준 {_sector_base(d)[0]}배). " +
+                            ("적자라 PER 의미 없음" if not d['per'] or d['per']<=0
+                             else "섹터 대비 저평가" if d['per'] < _sector_base(d)[0]
+                             else "섹터 대비 고평가") + "이에요.")),
+    dict(tag="Value", title="PBR 밸류", sub="섹터 대비 순자산 멀티플(낮을수록 저평가)",
+         score=lambda d: _pbr_score(d),
+         comment=lambda d: (f"PBR {r1(d['pbr'])}배 (섹터 기준 {_sector_base(d)[1]}배). " +
+                            ("섹터 대비 저평가" if d['pbr'] < _sector_base(d)[1] else "섹터 대비 프리미엄") + "이에요.")),
     dict(tag="Value", title="배당 매력", sub="시가배당률",
          score=lambda d: clamp(d["dividendYield"] * 20),
          comment=lambda d: f"시가배당률 {r1(d['dividendYield'])}%예요. {'배당 매력이 높아요' if d['dividendYield']>=3 else '배당은 보통이에요' if d['dividendYield']>0 else '배당이 거의 없어요'}."),
