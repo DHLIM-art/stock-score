@@ -616,9 +616,21 @@ def fetch_yf_fundamentals(ticker: str):
         if roe is not None:
             out["roeAnnual"] = r1(roe * 100)
         per = info.get("trailingPE") or info.get("forwardPE")
+        if (not per or per <= 0):
+            # 폴백: 주가 ÷ 주당순이익(EPS)
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            eps = info.get("trailingEps") or info.get("epsTrailingTwelveMonths")
+            if price and eps and eps > 0:
+                per = price / eps
         if per and per > 0:
             out["per"] = r1(per)
         pbr = info.get("priceToBook")
+        if (not pbr or pbr <= 0):
+            # 폴백: 주가 ÷ 주당순자산(BVPS)
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            bvps = info.get("bookValue")
+            if price and bvps and bvps > 0:
+                pbr = price / bvps
         if pbr and pbr > 0:
             out["pbr"] = r1(pbr)
         dy = info.get("dividendYield")
