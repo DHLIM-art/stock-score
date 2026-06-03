@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import sys
 
-ENGINE_VERSION = "v5 (2026-06-02, ROE=TTM)"  # 배포 확인용 — 화면에 표시됨
+ENGINE_VERSION = "v6 (2026-06-02, 섹터PER/PBR)"  # 배포 확인용 — 화면에 표시됨
 
 import numpy as np
 import pandas as pd
