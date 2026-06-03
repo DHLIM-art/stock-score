@@ -811,7 +811,34 @@ def _dart_accounts(corp, year, reprt_code, api_key):
         return None
 
 
-def fetch_dart(ticker, api_key):
+def _dart_shares(corp, year, reprt_code, api_key):
+    """DART 주식총수현황(stockTotqySttus)에서 유통주식수(보통주) 추정."""
+    try:
+        import requests
+        r = requests.get("https://opendart.fss.or.kr/api/stockTotqySttus.json",
+                         params={"crtfc_key": api_key, "corp_code": corp,
+                                 "bsns_year": str(year), "reprt_code": reprt_code}, timeout=12)
+        j = r.json()
+        if j.get("status") != "000":
+            return None
+        # '보통주' 행의 유통주식수(distb_stock_co) 우선, 없으면 발행주식총수(istc_totqy)
+        for it in j.get("list", []):
+            se = it.get("se", "")
+            if "보통주" in se or "합계" in se:
+                v = _to_num(it.get("distb_stock_co")) or _to_num(it.get("istc_totqy"))
+                if v and v > 0:
+                    return v
+        # 못 찾으면 첫 행
+        for it in j.get("list", []):
+            v = _to_num(it.get("istc_totqy"))
+            if v and v > 0:
+                return v
+    except Exception:
+        pass
+    return None
+
+
+def fetch_dart(ticker, api_key, price=None):
     """DART 공시에서 ROE(분기 연환산)·부채비율·순이익 YoY 성장 수집."""
     out, warns = {}, []
     code = _norm_krx(ticker)
@@ -863,6 +890,20 @@ def fetch_dart(ticker, api_key):
         if psn not in (None, 0):
             out["epsGrowthQoQ"] = r1((ni - psn) / abs(psn) * 100)
             out["epsAccelQuarters"] = 2 if out["epsGrowthQoQ"] > 0 else 0
+
+    # PER·PBR: 주식수를 받아 직접 계산 (주가 필요)
+    if price and price > 0:
+        shares = _dart_shares(corp, by, rc, api_key) or _dart_shares(corp, by, "11011", api_key)
+        if shares and shares > 0:
+            if ttm_ni is not None and ttm_ni > 0:
+                eps_ps = ttm_ni / shares
+                if eps_ps > 0:
+                    out["per"] = r1(price / eps_ps)        # PER = 주가 / 주당순이익
+            if eq is not None and eq > 0:
+                bps = eq / shares
+                if bps > 0:
+                    out["pbr"] = r1(price / bps)            # PBR = 주가 / 주당순자산
+
     out["_dartLabel"] = f"{by} {lab}"
     return out, warns
 
@@ -909,7 +950,7 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
         data["rsRating"] = int(clamp(round(60 + data.get("return12m", 0) * 0.05), 1, 99))
 
         # 펀더멘털: DART(공식 공시) → 네이버 → yfinance → 중립값 순
-        dt, wdt = (fetch_dart(ticker, dart_key) if dart_key else ({}, []))
+        dt, wdt = (fetch_dart(ticker, dart_key, price=data.get("price")) if dart_key else ({}, []))
         warnings += wdt
         nv, w3 = fetch_naver(ticker)
         warnings += w3
