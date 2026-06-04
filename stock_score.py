@@ -996,6 +996,12 @@ def build_inputs(ticker: str, overrides: dict | None = None, period_days: int = 
         fill("debtRatio", 80.0)
         fill("epsGrowthQoQ", 0.0)
 
+        # 섹터: yfinance가 주면 사용. 한국 종목은 코드 6자리면 반도체 등 추정 어려워 일반기준.
+        if yf_f.get("sector"):
+            data["sector"] = yf_f["sector"]
+        elif nv.get("sector"):
+            data["sector"] = nv["sector"]
+
         # 각 항목이 어디서 왔는지 기록 (화면에 출처 표시용)
         _LABELS = {"roeAnnual": "ROE", "per": "PER", "pbr": "PBR",
                    "dividendYield": "배당", "debtRatio": "부채비율", "epsGrowthQoQ": "EPS성장"}
@@ -1068,7 +1074,7 @@ _SECTOR_BASE = {
     "financial":   (9, 1.0),  "은행":       (8,  0.8),   "에너지":   (12, 1.8),
     "energy":      (12, 1.8), "소재":       (14, 2),     "유틸리티": (16, 1.5),
 }
-_DEFAULT_BASE = (18, 2.5)   # 섹터 불명 시 일반 기준
+_DEFAULT_BASE = (25, 4.0)   # 섹터 불명 시 일반 기준(성장주 고려해 다소 높게)
 
 def _sector_base(d):
     s = str(d.get("sector", "")).lower()
@@ -1080,17 +1086,17 @@ def _sector_base(d):
 def _per_score(d):
     per = d.get("per", 0)
     if not per or per <= 0:
-        return 25     # 적자(PER 의미 없음) — 약하게
+        return 25     # 적자(PER 의미 없음)
     base = _sector_base(d)[0]
-    # 기준선이면 55점, 절반 가격이면 ~90, 2배면 ~20 (섹터 보정)
-    return clamp(55 + (base - per) / base * 70)
+    # 기준선이면 55점. 완만한 기울기 + 하한 8점(고PER이어도 0으로 떨구지 않음)
+    return clamp(55 + (base - per) / base * 45, 8, 100)
 
 def _pbr_score(d):
     pbr = d.get("pbr", 0)
     if not pbr or pbr <= 0:
         return 40
     base = _sector_base(d)[1]
-    return clamp(55 + (base - pbr) / base * 70)
+    return clamp(55 + (base - pbr) / base * 45, 8, 100)
 
 def _roe_eff(d):
     """점수용 ROE = TTM(최근 1년) ROE. 최근 분기는 TTM에 이미 포함됨."""
